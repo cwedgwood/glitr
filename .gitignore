@@ -1,0 +1,35 @@
+# qemu VM lab artifacts (large / disposable — never committed)
+/vmlab/images/
+/vmlab/run/
+
+# Go build output
+/bin/
+*.test
+/.ref/
+/.build/
+
+# root-level built binaries (ship to VM via tools/livetest.sh)
+/applianced
+/storage.test
+/bsprobe
+/labtest
+/iprobe
+/fencetest
+/.labtest-build
+/.deploy-applianced
+
+# Review-round scratch: spec drafts and model transcripts, not project source.
+# Five of these were committed once (4345910) along with a 10 MB unstripped
+# fencetest binary -- in a repository whose test runner hashes /proc/<pid>/exe
+# specifically because a stale binary once produced three green suites.
+/t[0-9]*.txt
+
+# local agent memory store (not project code)
+/.github/copilot-memories.*
+
+# live-coverage artifacts (tools/coverage-live.sh)
+/.applianced-cover
+/.live-coverage/
+
+# stray temp file a misconfigured Coordinator used to write (see persist())
+.tmp
