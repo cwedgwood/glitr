@@ -1,0 +1,23 @@
+# Restore the saved LIO configuration at boot. File-authoritative: the saved
+# JSON wins, and anything in the kernel tree that is not in it is removed.
+#
+# WARNING: enable this ONLY on a host where nothing else manages LIO.
+# ExecStop runs `lish clear`, which tears down every export on the host --
+# including any created by another program. On a host running a daemon that
+# owns its own exports, that is a data-path outage on stop.
+[Unit]
+Description=glitr LIO configuration (lish restore)
+Documentation=https://github.com/cwedgwood/glitr
+Requires=sys-kernel-config.mount
+After=sys-kernel-config.mount network.target
+# Mutual exclusion with the appliance daemon: one LIO writer per host.
+Conflicts=applianced.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/lish restore
+ExecStop=/usr/local/sbin/lish clear
+
+[Install]
+WantedBy=multi-user.target
