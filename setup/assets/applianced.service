@@ -1,0 +1,25 @@
+# glitr storage appliance — installed by `applianced setup-system`.
+# The REST API is UNAUTHENTICATED; keep -listen on a trusted interface.
+[Unit]
+Description=glitr storage appliance (LIO iSCSI target + REST)
+Documentation=https://github.com/cwedgwood/glitr
+Requires=sys-kernel-config.mount
+After=sys-kernel-config.mount
+# Deliberately NOT ordered after network-online.target: the daemon binds
+# wildcard addresses (iSCSI portal 0.0.0.0:3260, REST -listen) which succeed
+# regardless of interface state, and gating on network-online makes startup
+# hostage to any NIC that never reaches "online" (e.g. an unconfigured or
+# carrier-less interface leaves systemd-networkd-wait-online activating
+# forever, which would otherwise block this unit indefinitely).
+# One writer per host: never co-run with the targetcli boot writer.
+Conflicts=target.service rtslib-fb-targetctl.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/glitr/applianced.env
+ExecStart=/usr/local/sbin/applianced serve $GLITR_ARGS
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
