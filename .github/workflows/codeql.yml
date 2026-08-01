@@ -1,0 +1,48 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  # actions: read is required on PRIVATE repositories -- the action reads the
+  # workflow run it belongs to. Without it the analysis completes and then
+  # fails at upload with "Resource not accessible by integration", which reads
+  # like a CodeQL fault rather than a permissions one. Public repositories do
+  # not need it, so a config copied from one looks correct until it is used
+  # somewhere private. MEASURED: run 31301102920 failed exactly that way.
+  actions: read
+  packages: read
+
+jobs:
+  analyze:
+    name: analyze
+    runs-on: ubuntu-latest
+    # Code scanning is not available on a private personal repository -- it
+    # needs GitHub Advanced Security there, and is free once the repository is
+    # public. Without this guard the job analyses the code correctly and then
+    # fails at upload with "Code scanning is not enabled for this repository",
+    # which is a permanently red workflow that says nothing about the code and
+    # teaches everyone to ignore the badge. Skipping is honest; the job starts
+    # working by itself the moment the repository goes public, with nothing to
+    # remember to turn on.
+    if: ${{ !github.event.repository.private }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6
+        with:
+          languages: go
+      - name: Build
+        run: go build ./...
+      - name: Analyze
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v4.37.6

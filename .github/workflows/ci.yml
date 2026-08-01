@@ -1,0 +1,303 @@
+# Actions are pinned to full commit SHAs, with the tag they correspond to in a
+# trailing comment. A mutable tag is a supply-chain hole: whoever controls the
+# action repository can move it, and this workflow has a checkout of the source
+# in its filesystem. Dependabot keeps the pins fresh (.github/dependabot.yml).
+#
+# What this CI does NOT cover: the eleven live suites that exercise fencing
+# against a real kernel need configfs, the LIO modules, root, and two iSCSI
+# initiators. A green run here means the code is sound, not that fencing works.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 1.25 is the declared floor (go.mod): the OLDEST Go still receiving security
+  # fixes, since Go supports the last two majors. Not the newest, which would
+  # exclude people who are fully supported; not older, which would mean
+  # claiming to support a toolchain nobody is patching. Testing it alongside
+  # stable is what keeps the claim honest rather than aspirational.
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25", "stable"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+      - name: go build
+        run: go build ./...
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test -count=1 ./...
+
+  race:
+    name: race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          check-latest: true
+      # The appliance holds a mutex across uncancellable configfs operations and
+      # publishes health from several paths; races there are the kind that only
+      # appear under load in production.
+      - name: go test -race
+        run: go test -count=1 -race -timeout 15m ./...
+
+  gofmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: gofmt -l
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+  # Having no dependencies is a feature of this library, not an accident: it is
+  # meant to keep working for years without anyone maintaining it, and every
+  # dependency is a thing that can rot, break, or be taken over. Asserted rather
+  # than hoped for, so adding one is a deliberate decision with a red CI run
+  # attached, not something that happens quietly in a refactor.
+  modules:
+    name: modules (no external dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          check-latest: true
+      - name: go mod tidy is clean
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: go mod verify
+        run: go mod verify
+      - name: the module graph has nothing third-party in it
+        run: |
+          # Modern Go lists the toolchain pseudo-modules (go@x, toolchain@x) in
+          # the graph, so an empty graph is the wrong thing to assert -- it
+          # would fail here and teach everyone to ignore this job. Drop those
+          # and require that nothing else remains.
+          graph="$(go mod graph | tr ' ' '\n' | grep -v '^go@' | grep -v '^toolchain@' | grep -v '^github.com/cwedgwood/glitr$' | sort -u)"
+          if [ -n "$graph" ]; then
+            echo "this module has acquired dependencies:" >&2
+            echo "$graph" >&2
+            exit 1
+          fi
+
+  # The layering claim in the README -- each package usable without the ones
+  # after it -- is either true of the dependency graph or it is marketing.
+  # Asserted with `go list -deps`, which is the real graph, rather than by
+  # grepping import blocks, which misses transitive edges.
+  layering:
+    name: layering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: scsi, hostlock and setup depend on nothing in this module
+        run: |
+          for pkg in ./scsi ./hostlock ./setup; do
+            internal="$(go list -deps "$pkg" | grep '^github.com/cwedgwood/glitr' | grep -v "^github.com/cwedgwood/glitr$" || true)"
+            # The package always lists itself; anything else is an edge.
+            internal="$(printf '%s\n' "$internal" | grep -v "^github.com/cwedgwood/glitr${pkg#.}$" || true)"
+            if [ -n "$internal" ]; then
+              echo "$pkg has grown an internal dependency:" >&2
+              printf '%s\n' "$internal" >&2
+              exit 1
+            fi
+          done
+      - name: lio depends only on lio/configfs
+        run: |
+          extra="$(go list -deps ./lio \
+            | grep '^github.com/cwedgwood/glitr' \
+            | grep -vx 'github.com/cwedgwood/glitr/lio' \
+            | grep -vx 'github.com/cwedgwood/glitr/lio/configfs' || true)"
+          if [ -n "$extra" ]; then
+            echo "lio reaches beyond lio/configfs:" >&2
+            printf '%s\n' "$extra" >&2
+            exit 1
+          fi
+      - name: the appliance does not import the initiator-side packages
+        run: |
+          # scsi issues SCSI commands to a device an INITIATOR has attached. The
+          # appliance is the target: if it ever needs scsi, something has been
+          # designed inside out.
+          if go list -deps ./appliance ./cmd/applianced | grep -qx 'github.com/cwedgwood/glitr/scsi'; then
+            echo "the appliance imports scsi" >&2
+            exit 1
+          fi
+
+  # Licensing is a release-blocking property, not cleanup. This project changed
+  # licence twice before publication (GPLv3 -> LGPLv3 -> Apache-2.0), and each
+  # time the residue was checked by hand. A check that depends on somebody
+  # remembering is not a check.
+  licensing:
+    name: licensing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: LICENSE is verbatim Apache-2.0
+        run: |
+          want=cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+          got="$(sha256sum LICENSE | cut -d' ' -f1)"
+          if [ "$got" != "$want" ]; then
+            echo "LICENSE is not the verbatim Apache-2.0 text" >&2
+            echo "  got  $got" >&2
+            echo "  want $want" >&2
+            exit 1
+          fi
+      - name: no reciprocal-licence text survives anywhere
+        run: |
+          if git grep -nIE 'GNU (Lesser )?General Public License|COPYING\.LESSER|LGPL|GPLv[23]' \
+               -- . ':!.github/workflows/ci.yml' > /tmp/hits; then
+            echo "reciprocal-licence text found:" >&2
+            cat /tmp/hits >&2
+            exit 1
+          fi
+
+  # Parsers here take input from the kernel, and the kernel's PROSE is not a
+  # stable interface even though its ABI is. A short smoke run per target is
+  # enough to catch a regression on a PR without turning CI into a fuzzing farm.
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: lio parsers
+        run: |
+          for t in FuzzParseHolder FuzzParseSessionISID FuzzParseRegisteredISIDs \
+                   FuzzParseAPTPLRecord FuzzParseRegistrations FuzzParsePortal \
+                   FuzzParseInfoLine FuzzPRTypeText FuzzParseTPGTAndLUN; do
+            echo "--- $t"
+            go test -run '^$' -fuzz "^${t}$" -fuzztime 20s ./lio
+          done
+      - name: scsi parsers
+        run: |
+          for t in FuzzParseReadKeys FuzzParseReadReservation FuzzParseSense FuzzParseCapacity16; do
+            echo "--- $t"
+            go test -run '^$' -fuzz "^${t}$" -fuzztime 20s ./scsi
+          done
+
+  # Two integer-overflow faults in scsi were found by fuzzing on amd64, both in
+  # arithmetic on device-reported values. 32-bit is where that class bites
+  # hardest, and arm64 is a realistic target for a storage appliance.
+  crossbuild:
+    name: cross-build linux/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [arm64, "386", riscv64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: go build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go build ./...
+      - name: go vet
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go vet ./...
+      # Building is not the assertion this job's comment claims to make. A
+      # 32-bit fail-open in parseReadKeys -- a device-reported length widened
+      # into a negative int, which silently returned an EMPTY key list --
+      # compiled and vetted perfectly on 386. Only running the tests there
+      # catches that class, and 386 binaries execute on an amd64 runner.
+      - name: go test (386 only; the others need an emulator)
+        if: matrix.goarch == '386'
+        env:
+          GOOS: linux
+          GOARCH: "386"
+        run: go test -count=1 ./scsi/... ./lio/... ./storage/...
+
+  # There is deliberately no nilaway job. Measured on this codebase it found
+  # nothing and reported three false positives, because it models nilness but
+  # not the facts that make these safe: that http.Client.Get guarantees a
+  # non-nil response when err is nil, that len(s) > 0 implies s is non-nil, and
+  # that a buffer allocated under `if n > 0` exists in that branch. It was also
+  # silent on the one real nil panic this project has had (a parser indexing
+  # strings.Fields("")), which `go test -fuzz` found in under a second.
+  #
+  # A job whose only output is false positives is a job people learn to ignore,
+  # which is the same failure this project just fixed in `applianced preflight`.
+  # Worth revisiting if nilaway learns those correlations.
+
+  staticcheck:
+    name: staticcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+      - name: staticcheck
+        run: staticcheck ./...
+
+  docs:
+    name: docs render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: go doc renders for every package
+        run: |
+          for pkg in $(go list ./...); do
+            go doc "$pkg" > /dev/null
+            go doc -all "$pkg" > /dev/null
+          done
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+      - name: go test -cover
+        run: go test -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+      - name: report
+        run: go tool cover -func=coverage.out | tail -n 25
