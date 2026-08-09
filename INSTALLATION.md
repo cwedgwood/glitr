@@ -109,6 +109,27 @@ without restoring the reservation that is not. **Alert on the `status` field,
 not only on the status code.** The fencing fields are present on the degraded
 response too.
 
+### Volumes are thin, and space comes back
+
+A volume's backing file is sparse: a 1 TiB volume costs nothing until something
+writes to it, and the appliance will happily hand out more capacity than the
+data disk has. **That is overcommit, and running out is your problem to
+watch** — `df` on the data disk tells you the truth, not the volume sizes.
+
+Volumes advertise `UNMAP`, so a guest that discards (`fstrim`, `mount -o
+discard`, `blkdiscard`) returns the space to the data disk. Two things are
+worth knowing:
+
+- **A snapshot shares its parent's blocks.** Discarding a range on one of them
+  frees nothing until *every* volume sharing those blocks has discarded it.
+  Trimming a clone and seeing `df` not move is correct behaviour, not a leak.
+- **Reads of a discarded region return zeros**, but the device does not
+  formally promise it (`LBPRZ` is not advertised), so do not rely on discard as
+  a way to erase data.
+
+`-no-unmap` turns this off, for a backing filesystem that cannot punch holes.
+Volumes are still sparse; they just never shrink.
+
 ### Unmapping a reservation holder releases its reservation
 
 `POST /volumes/{uuid}/lununmap` for a host that holds a SCSI-3 reservation
