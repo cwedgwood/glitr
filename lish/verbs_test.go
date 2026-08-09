@@ -59,3 +59,28 @@ func TestContextualVerbsStillLock(t *testing.T) {
 		}
 	}
 }
+
+// TestParsePortRefusesOutOfRange is the regression test for a truncation
+// CodeQL found on its first run against the public repository.
+//
+// strconv.Atoi returns an int, and narrowing it with uint16(...) silently
+// wraps: "70000" became 4464, so the shell created a portal on a port nobody
+// asked for. lio.Portal.Port was made a uint16 so that value could not be
+// represented -- and a mechanical conversion at the parse boundary put the bug
+// back at the one place untrusted input arrives.
+func TestParsePortRefusesOutOfRange(t *testing.T) {
+	for _, bad := range []string{"70000", "65536", "-1", "4294967296", "", "http", "3260x"} {
+		if got, err := parsePort(bad); err == nil {
+			t.Errorf("parsePort(%q) = %d, want an error", bad, got)
+		}
+	}
+	for in, want := range map[string]uint16{"0": 0, "1": 1, "3260": 3260, "65535": 65535} {
+		got, err := parsePort(in)
+		if err != nil {
+			t.Errorf("parsePort(%q): %v", in, err)
+		}
+		if got != want {
+			t.Errorf("parsePort(%q) = %d, want %d", in, got, want)
+		}
+	}
+}
