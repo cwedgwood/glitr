@@ -189,6 +189,14 @@ jobs:
   # Parsers here take input from the kernel, and the kernel's PROSE is not a
   # stable interface even though its ABI is. A short smoke run per target is
   # enough to catch a regression on a PR without turning CI into a fuzzing farm.
+  #
+  # Bounded by EXEC COUNT, not by time. With -fuzztime <duration> the run can
+  # fail with "context deadline exceeded" when the deadline fires during the
+  # coordinator's own shutdown -- no crasher, no failing input, just a timer
+  # race, and it happened on a real PR after 1.1M clean execs. A job that fails
+  # for a non-reason is one people learn to re-run without reading, which is
+  # exactly how a real crasher gets waved through. A count also makes the run
+  # take the same work on a slow runner as a fast one.
   fuzz:
     name: fuzz smoke
     runs-on: ubuntu-latest
@@ -203,13 +211,13 @@ jobs:
                    FuzzParseAPTPLRecord FuzzParseRegistrations FuzzParsePortal \
                    FuzzParseInfoLine FuzzPRTypeText FuzzParseTPGTAndLUN; do
             echo "--- $t"
-            go test -run '^$' -fuzz "^${t}$" -fuzztime 20s ./lio
+            go test -run '^$' -fuzz "^${t}$" -fuzztime 250000x ./lio
           done
       - name: scsi parsers
         run: |
           for t in FuzzParseReadKeys FuzzParseReadReservation FuzzParseSense FuzzParseCapacity16; do
             echo "--- $t"
-            go test -run '^$' -fuzz "^${t}$" -fuzztime 20s ./scsi
+            go test -run '^$' -fuzz "^${t}$" -fuzztime 250000x ./scsi
           done
 
   # Two integer-overflow faults in scsi were found by fuzzing on amd64, both in
