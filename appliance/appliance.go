@@ -121,6 +121,26 @@ type Config struct {
 	// created, so a per-volume knob would produce a fleet whose durability
 	// varies by creation order.
 	WriteBack bool `json:"write_back"`
+
+	// NoUnmap disables thin provisioning: the volume stops advertising UNMAP,
+	// so a guest cannot return space it has freed.
+	//
+	// Inverted -- default OFF, meaning UNMAP is ON -- because the backing
+	// files are sparse whether or not this is set. Without UNMAP the device is
+	// thin on disk and claims to be fully provisioned on the wire, which is
+	// the incoherent combination: the pool can still be overcommitted and can
+	// still fill up, and the guest has no way to help. Advertising it makes
+	// the wire match the disk.
+	//
+	// The escape hatch exists for a backing filesystem that cannot punch holes
+	// (the kernel would then fail each UNMAP rather than silently ignoring
+	// it), and for anyone who wants volumes to only ever grow.
+	//
+	// Appliance-wide, like WriteBack. The kernel does allow this per backstore
+	// -- it is settable while exported -- but a fleet where some volumes
+	// return space and others do not is a fleet whose free-space arithmetic
+	// nobody can do.
+	NoUnmap bool `json:"no_unmap"`
 }
 
 // Host is a first-class client object carrying one or more initiator IQNs

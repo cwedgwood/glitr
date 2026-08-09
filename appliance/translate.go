@@ -182,6 +182,26 @@ func (c *Coordinator) desiredLIO() lio.Config {
 				// value is enforced on every reconcile and any divergence
 				// shows up as drift.
 				"emulate_write_cache": boolAttr(c.cfg.WriteBack),
+				// Thin provisioning. The backing file is sparse either way;
+				// these two decide whether the initiator is TOLD, and so
+				// whether it can hand space back. Managed rather than left at
+				// the kernel default (which is off) for the same reason as
+				// emulate_write_cache: enforced on every reconcile, and any
+				// divergence shows up as drift.
+				//
+				// emulate_tpws is WRITE SAME with the UNMAP bit -- how a guest
+				// zeroes a large range without writing zeroes. Paired with tpu
+				// deliberately: advertising one without the other gives a
+				// device that can discard but not zero efficiently, or the
+				// reverse, and no guest expects that combination.
+				//
+				// unmap_zeroes_data (LBPRZ) is deliberately NOT set here. It
+				// promises that a discarded region reads back as zeros, which
+				// is true of a hole in a sparse file -- MEASURED -- but it is
+				// a promise about every future backing store, and the safe
+				// direction for a promise is to under-claim.
+				"emulate_tpu":  boolAttr(!c.cfg.NoUnmap),
+				"emulate_tpws": boolAttr(!c.cfg.NoUnmap),
 			},
 		})
 		tpg.LUNs = append(tpg.LUNs, lio.LUN{Index: idx, Backstore: name})

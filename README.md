@@ -76,6 +76,12 @@ It is also why verdicts in that area are SCSI status bytes and errnos rather
 than the text some tool printed — `0x18` means the same thing in every locale,
 and `strerror` does not.
 
+Volumes are thin: the backing file is sparse, and they advertise `UNMAP` so a
+guest can return space it has freed. The appliance can therefore be
+overcommitted — deliberately, since the alternative is pretending a sparse file
+is a full one — so the data disk's free space is the number that matters, not
+the sum of the volume sizes.
+
 ## Layers
 
 Each is usable without the ones after it.

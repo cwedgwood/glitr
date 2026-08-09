@@ -917,7 +917,22 @@ func (a *applyCtx) removeBackstore(b Backstore) error {
 // is half of the write-cache weld, and a saved config that omitted it restored
 // a write-back device as write-through. See discoverBackstores for the other
 // half, which is not an attribute at all.
-var discoveredBackstoreAttrs = []string{"block_size", "emulate_write_cache", "optimal_sectors"}
+//
+// emulate_tpu and emulate_tpws are the thin-provisioning pair: whether the
+// device advertises UNMAP and WRITE SAME with unmap. They are discovered for
+// the same reason as emulate_write_cache -- a saved config that omitted them
+// restores a thin device as fully provisioned, and the guest then stops
+// returning space that the backing file would happily give back. Unlike
+// block_size they are settable while exported, so a reconcile can turn them on
+// for a fleet that already exists (MEASURED on linux 6.6.144.1: writing
+// attrib/emulate_tpu on an exported fileio backstore is accepted and takes
+// effect without re-export).
+//
+// Absent is tolerated, not an error: a backend with no UNMAP support does not
+// expose them, and discoverBackstores skips attributes that do not exist.
+var discoveredBackstoreAttrs = []string{
+	"block_size", "emulate_write_cache", "emulate_tpu", "emulate_tpws", "optimal_sectors",
+}
 
 // discoverBackstores enumerates core/*_*/<name> storage objects.
 func discoverBackstores(fs *configfs.FS) ([]Backstore, error) {

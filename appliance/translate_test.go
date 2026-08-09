@@ -238,3 +238,65 @@ func TestAppliedViewRecordsLiveValueNotDesired(t *testing.T) {
 		t.Errorf("a clean reconcile must leave nothing to revisit, got %v", d.Add.Backstores)
 	}
 }
+
+// TestThinProvisioningIsAdvertisedByDefault pins that volumes advertise UNMAP
+// unless it is explicitly turned off.
+//
+// The backing files are sparse either way. Without these attributes the device
+// is thin on disk and claims to be fully provisioned on the wire, so the pool
+// can be overcommitted and filled with space that nothing will ever return --
+// the incoherent combination, and the one that used to be the default.
+func TestThinProvisioningIsAdvertisedByDefault(t *testing.T) {
+	attrsFor := func(cfg Config) map[string]string {
+		t.Helper()
+		st, err := storage.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, err := st.Create(1<<20, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := &Coordinator{store: st, cfg: cfg, st: dbState{
+			Hosts:       []*Host{{UUID: "h", IQNs: []string{"iqn.1993-08.org.debian:01:a"}}},
+			Attachments: []*Attachment{{VolumeUUID: v.UUID, HostUUID: "h", Desired: "attached", LUN: 0}},
+			Exports:     map[string]int{v.UUID: 0},
+		}}
+		bs := c.desiredLIO().Backstores
+		if len(bs) != 1 {
+			t.Fatalf("got %d backstores, want 1", len(bs))
+		}
+		return bs[0].Attributes
+	}
+
+	base := Config{TargetIQN: "iqn.2026-01.dev.glitr:t"}
+
+	on := attrsFor(base)
+	if on["emulate_tpu"] != "1" || on["emulate_tpws"] != "1" {
+		t.Errorf("by default UNMAP must be advertised, got tpu=%q tpws=%q",
+			on["emulate_tpu"], on["emulate_tpws"])
+	}
+
+	off := base
+	off.NoUnmap = true
+	got := attrsFor(off)
+	if got["emulate_tpu"] != "0" || got["emulate_tpws"] != "0" {
+		t.Errorf("-no-unmap must disable both, got tpu=%q tpws=%q",
+			got["emulate_tpu"], got["emulate_tpws"])
+	}
+
+	// Managed either way, so a reconcile enforces the choice and any
+	// divergence shows as drift. Absent would mean "whatever the kernel did".
+	for _, k := range []string{"emulate_tpu", "emulate_tpws"} {
+		if _, ok := on[k]; !ok {
+			t.Errorf("%s is not managed, so drift cannot see it", k)
+		}
+	}
+
+	// LBPRZ is deliberately not claimed: it promises reads-as-zeros for every
+	// future backing store, and the safe direction for a promise is to
+	// under-claim.
+	if _, ok := on["unmap_zeroes_data"]; ok {
+		t.Error("unmap_zeroes_data is being claimed; that promise is deliberately not made")
+	}
+}

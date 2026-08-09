@@ -118,6 +118,12 @@ func serve(args []string) {
 			"(WCE=1). FASTER, and NOT durable across power loss -- for development and "+
 			"test targets only. Off means every write reaches stable storage before it "+
 			"is acknowledged.")
+	noUnmap := fs.Bool("no-unmap", false,
+		"do not advertise UNMAP, so a guest cannot return space it has freed. The "+
+			"backing files are sparse either way: without this the device is thin on "+
+			"disk and claims to be fully provisioned on the wire, so the pool can fill "+
+			"up with space nothing will ever give back. Set it only where the backing "+
+			"filesystem cannot punch holes.")
 	parseFlags(fs, args)
 
 	// Check the settings BEFORE taking the host lock or touching the kernel.
@@ -189,6 +195,7 @@ func serve(args []string) {
 		Portals:   parsedPortals,
 		DBRoot:    dbRoot,
 		WriteBack: *writeBack,
+		NoUnmap:   *noUnmap,
 	}
 	if *writeBack {
 		log.Printf("WARNING: -write-back is set: writes are acknowledged from the page cache " +
