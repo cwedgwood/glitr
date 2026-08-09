@@ -95,11 +95,11 @@ func (s *Shell) cmdCreate(args []string) error {
 		if len(args) < 1 {
 			return fmt.Errorf("usage: create <ip> [port]")
 		}
-		port := lio.DefaultPortalPort
+		port := uint16(lio.DefaultPortalPort)
 		if len(args) >= 2 {
-			p, err := strconv.Atoi(args[1])
+			p, err := parsePort(args[1])
 			if err != nil {
-				return fmt.Errorf("bad port %q: %w", args[1], err)
+				return err
 			}
 			port = p
 		}
@@ -107,7 +107,7 @@ func (s *Shell) cmdCreate(args []string) error {
 		if !ok {
 			return fmt.Errorf("bad portal address %q", args[0])
 		}
-		np.Port = uint16(port)
+		np.Port = port
 		return s.editTPG(func(g *lio.TPG) error {
 			for _, pt := range g.Portals {
 				// Addr comparison, so two spellings of one IPv6 address are
@@ -199,12 +199,12 @@ func (s *Shell) cmdDelete(args []string) error {
 		}
 		p, ok := parsePortalLabel(strings.Join(args, ":"))
 		if len(args) >= 2 {
-			pt, err := strconv.Atoi(args[1])
+			pt, err := parsePort(args[1])
 			if err != nil {
-				return fmt.Errorf("bad port %q: %w", args[1], err)
+				return err
 			}
 			p, ok = lio.ParsePortal(args[0])
-			p.Port = uint16(pt)
+			p.Port = pt
 		}
 		if !ok {
 			return fmt.Errorf("bad portal %v", args)
@@ -616,4 +616,21 @@ func summarySuffix(s string) string {
 		return ""
 	}
 	return " " + s
+}
+
+// parsePort converts operator input to a port, refusing anything a port
+// cannot be.
+//
+// strconv.Atoi returns an int and this used to narrow it with uint16(...),
+// which TRUNCATES: "70000" became 4464, so the shell would quietly create a
+// portal on a port nobody asked for. lio.Portal.Port was made a uint16
+// precisely so that value is unrepresentable, and a mechanical uint16(...) at
+// the parse boundary put the bug straight back at the one place untrusted
+// input arrives. Found by CodeQL on its first run against the public repo.
+func parsePort(s string) (uint16, error) {
+	n, err := strconv.ParseUint(s, 10, 16)
+	if err != nil {
+		return 0, fmt.Errorf("bad port %q: must be 0-65535", s)
+	}
+	return uint16(n), nil
 }
