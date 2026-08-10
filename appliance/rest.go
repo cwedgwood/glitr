@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/cwedgwood/glitr/lio"
+	"github.com/cwedgwood/glitr/storage"
 )
 
 // Handler returns the appliance REST API: a minimal bespoke shape over
@@ -189,7 +190,7 @@ func Handler(c *Coordinator) http.Handler {
 			return
 		}
 		v, err := c.CreateVolume(req.Size, req.BlockSize)
-		respond(w, v, http.StatusCreated, err)
+		respondVolume(w, v, http.StatusCreated, err)
 	})
 
 	mux.HandleFunc("GET /volumes", func(w http.ResponseWriter, r *http.Request) {
@@ -222,7 +223,7 @@ func Handler(c *Coordinator) http.Handler {
 
 	mux.HandleFunc("POST /volumes/{uuid}/snapshot", func(w http.ResponseWriter, r *http.Request) {
 		v, err := c.SnapshotVolume(r.PathValue("uuid"))
-		respond(w, v, http.StatusCreated, err)
+		respondVolume(w, v, http.StatusCreated, err)
 	})
 
 	mux.HandleFunc("POST /volumes/{uuid}/lunmap", func(w http.ResponseWriter, r *http.Request) {
@@ -305,6 +306,27 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func errResp(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// respondVolume writes the result of an operation that mints a new volume
+// identity (create, snapshot).
+//
+// It differs from respond in one case: storage can return a REAL volume
+// alongside ErrPersistedNotDurable, where the db already names the volume but
+// the directory fsync was not proven. The status stays 500 -- the caller may
+// not assume the record survives a power cut -- but the body must carry the
+// volume, or the caller is left with a volume it cannot name, retry against,
+// or delete. respond drops the value whenever err is non-nil, which is right
+// everywhere else and wrong here.
+func respondVolume(w http.ResponseWriter, v storage.Volume, okCode int, err error) {
+	if errors.Is(err, storage.ErrPersistedNotDurable) && v.UUID != "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":  err.Error(),
+			"volume": v,
+		})
+		return
+	}
+	respond(w, v, okCode, err)
 }
 
 // respond writes v with okCode, or maps the error to an HTTP status: a
