@@ -106,11 +106,32 @@ func (c *Coordinator) CreateVolume(size int64, blockSize int) (storage.Volume, e
 		return storage.Volume{}, statusErr(http.StatusBadRequest,
 			"size %d must be a multiple of block_size %d", size, blockSize)
 	}
-	v, err := c.store.Create(size, blockSize)
-	if err != nil {
+	return volumeResult(c.store.Create(size, blockSize))
+}
+
+// volumeResult normalises the (*storage.Volume, error) pair the store returns
+// for the operations that mint a new identity.
+//
+// It exists because a non-nil volume and a non-nil error are not mutually
+// exclusive: storage returns BOTH for ErrPersistedNotDurable, where persist
+// renamed the db into place and only then failed to fsync the directory. By
+// the time the caller sees that error the db already NAMES the volume, and
+// the volume's directory and backing file are on disk.
+//
+// Both call sites used to `return storage.Volume{}, err` here, which threw the
+// UUID away. The volume was real -- it appears in GET /volumes and survives a
+// reopen -- but the caller that created it never learned its name, so it could
+// neither retry against it, resize it, nor delete it. That is the same class
+// of bug storage/store_test.go's TestSnapshotDoesNotDestroyDataOnANonDurablePersist
+// pins one layer down; storage honours the contract, the appliance did not.
+//
+// The error is still returned, and still maps to 500: durability was not
+// proven, so the caller must not assume the record survives a power cut.
+func volumeResult(v *storage.Volume, err error) (storage.Volume, error) {
+	if v == nil {
 		return storage.Volume{}, err
 	}
-	return *v, nil
+	return *v, err
 }
 
 // ListVolumes returns all volumes.
@@ -124,11 +145,7 @@ func (c *Coordinator) SnapshotVolume(uuid string) (storage.Volume, error) {
 	if _, ok := c.store.Get(uuid); !ok {
 		return storage.Volume{}, statusErr(http.StatusNotFound, "volume %s not found", uuid)
 	}
-	v, err := c.store.Snapshot(uuid)
-	if err != nil {
-		return storage.Volume{}, err
-	}
-	return *v, nil
+	return volumeResult(c.store.Snapshot(uuid))
 }
 
 // DeleteVolume removes a volume; rejected while it has attachments.
