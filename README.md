@@ -105,14 +105,14 @@ Installing the appliance: [`INSTALLATION.md`](INSTALLATION.md).
 
 ## Requirements
 
-Go 1.24 or newer, and Linux with configfs and the LIO modules
+Go 1.25 or newer, and Linux with configfs and the LIO modules
 (`target_core_mod`, `iscsi_target_mod`). Reflink snapshots need a filesystem
 that supports `FICLONE`, such as XFS or Btrfs.
 
 ## State, honestly
 
-The code is working and has been exercised against a real kernel — eleven live
-suites and roughly 250 assertions, on an Azure Linux 3.0 target with two Debian
+The code is working and has been exercised against a real kernel — twelve live
+suites and roughly 260 assertions, on an Azure Linux 3.0 target with two Debian
 initiators driving genuine iSCSI sessions, including reservation conflicts,
 multipath failover and fencing across a reboot.
 
@@ -122,7 +122,10 @@ live suites, and CI to run them, are intended to follow.
 
 Also worth knowing before you deploy it:
 
-- The REST API is **unauthenticated**. Bind it to a trusted interface.
+- The REST API is **unauthenticated**. Bind it to a trusted interface. That is
+  a deliberate non-goal rather than an oversight — the appliance is a
+  demonstration, and authentication is policy that belongs to whatever fronts
+  it. It is not expected to hold forever.
 - Parsers are fuzzed because their input comes from the kernel, and the
   kernel's *prose* is not a stable interface even though its ABI is. They are
   built to degrade to "I cannot tell" rather than to guess.
