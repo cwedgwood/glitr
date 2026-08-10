@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # This module has no external dependencies and the CI asserts that, so the
+  # gomod entry exists to notice if that ever stops being true rather than to
+  # do routine work.
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # The actions are pinned to commit SHAs, which is what makes them safe and
+  # also what makes them go stale silently. This is the thing that unsticks
+  # them.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
