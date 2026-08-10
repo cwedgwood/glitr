@@ -14,6 +14,25 @@
 // calling into lio (an incremental delta where possible, a full Sync
 // otherwise) — so the kernel always matches
 // the db, and startup replay is the same reconcile.
+//
+// What it does NOT do is span its two durable files transactionally. Volume
+// records live in storage's volumes.json under that package's mutex; hosts,
+// attachments and portals live in the appliance's own db under the coordinator
+// lock. Each file is replaced atomically; the pair is not, and a crash between
+// the two writes can leave a volume the appliance's db does not describe.
+//
+// That is deliberate, and it is why there is no durable caller-supplied
+// identity here. An external controller wanting to name volumes and retry
+// safely needs the name and the volume to commit together, and neither order
+// gives it: recording the name first cannot work, because storage mints the
+// UUID inside Create, so an intent record written beforehand cannot say what
+// it is about to make. The arrangement that WOULD be atomic is to carry the
+// name on the storage record itself — one file, one mutex — at the cost of
+// teaching storage about callers it has no business knowing about.
+//
+// Neither is attempted. Callers retry using the volume UUID the appliance
+// already returned. Anything needing crash-safe external identity wants a
+// transactional store underneath it, which this is not.
 package appliance
 
 import (
