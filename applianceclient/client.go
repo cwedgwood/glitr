@@ -111,7 +111,12 @@ type Health struct {
 	QuarantinedVolumeDirs []string `json:"quarantined_volume_dirs,omitempty"`
 	PRUnbound             []string `json:"pr_unbound,omitempty"`
 	PRStranded            []string `json:"pr_stranded,omitempty"`
-	AttributeDrift        []string `json:"attribute_drift,omitempty"`
+	// PRStrandUndecided names targets where the appliance cannot tell whether
+	// a reservation is stranded, because the kernel renders one session per
+	// ACL and the initiator holds several (multipath). It is NOT a fault and
+	// does not make Status a warning: nothing is wrong with the reservation.
+	PRStrandUndecided []string `json:"pr_strand_undecided,omitempty"`
+	AttributeDrift    []string `json:"attribute_drift,omitempty"`
 	// PortalFlagIgnored and IQNFlagIgnored are set when the appliance was
 	// started with a -portals or -iqn that disagrees with what it has
 	// recorded. Neither is an error -- the record wins by design -- but an

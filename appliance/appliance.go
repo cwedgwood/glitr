@@ -228,6 +228,8 @@ type Coordinator struct {
 	// without the other, and stored as text because it is a report.
 	// Guarded by healthMu.
 	prStranded []string
+	// prStrandUndecided is the blind-spot report that goes with prStranded.
+	prStrandUndecided []string
 	// prUnbound holds restored SCSI-3 PR registrations that did not bind.
 	// Guarded by healthMu.
 	prUnbound []string
@@ -281,6 +283,12 @@ type Health struct {
 	// the lab both registrations were stranded at once, so nothing could
 	// locate a registration to preempt with.
 	PRStranded []string
+	// PRStrandUndecided names targets where the strand question could not be
+	// answered, because the kernel holds sessions the per-ACL attributes do
+	// not render (multipath). NOT a warning: nothing is wrong with the
+	// reservations, and the alternative -- claiming a strand anyway -- is the
+	// false alarm this field exists to replace.
+	PRStrandUndecided []string
 	// Drift names managed attributes the kernel refused to change because
 	// the volume is exported. See lio.Report.Drift.
 	Drift []string
@@ -1036,7 +1044,7 @@ func (c *Coordinator) restoreState(b db) { c.st = b }
 // fencing state -- the full path through Sync, the incremental path through
 // VerifyAPTPL -- so leaving it to the periodic checker alone under-reported
 // the freshness of a fact that had just been established.
-func (c *Coordinator) publishReconcile(err error, unbound, stranded []string, drift []lio.AttrDrift) {
+func (c *Coordinator) publishReconcile(err error, unbound, stranded, undecided []string, drift []lio.AttrDrift) {
 	rendered := make([]string, 0, len(drift))
 	for _, d := range drift {
 		rendered = append(rendered, d.String())
@@ -1045,7 +1053,7 @@ func (c *Coordinator) publishReconcile(err error, unbound, stranded []string, dr
 	defer c.healthMu.Unlock()
 	c.healthErr = err
 	c.storePRUnboundLocked(unbound)
-	c.storePRStrandedLocked(stranded)
+	c.storePRStrandedLocked(stranded, undecided)
 	c.storeDriftLocked(rendered)
 	c.prCheckedAt = time.Now()
 }
@@ -1066,11 +1074,11 @@ func (c *Coordinator) publishReconcileFailure(err error) {
 
 // publishPRCheck publishes a periodic fencing re-verification: the warnings
 // and their timestamp together, so a reader cannot see one without the other.
-func (c *Coordinator) publishPRCheck(unbound, stranded []string) {
+func (c *Coordinator) publishPRCheck(unbound, stranded, undecided []string) {
 	c.healthMu.Lock()
 	defer c.healthMu.Unlock()
 	c.storePRUnboundLocked(unbound)
-	c.storePRStrandedLocked(stranded)
+	c.storePRStrandedLocked(stranded, undecided)
 	c.prCheckedAt = time.Now()
 }
 
@@ -1080,7 +1088,7 @@ func (c *Coordinator) publishPRCheck(unbound, stranded []string) {
 // Logged as a NOTICE, not a WARNING: the reservation is doing its job. What
 // makes it worth saying is that its holder cannot lift it, so an operator
 // waiting for the holder to release would wait forever.
-func (c *Coordinator) storePRStrandedLocked(stranded []string) {
+func (c *Coordinator) storePRStrandedLocked(stranded, undecided []string) {
 	for _, s := range stranded {
 		if !slices.Contains(c.prStranded, s) {
 			log.Printf("NOTICE: SCSI-3 PR reservation is in effect but its holder "+
@@ -1088,6 +1096,15 @@ func (c *Coordinator) storePRStrandedLocked(stranded []string) {
 		}
 	}
 	c.prStranded = stranded
+	// Logged once when newly seen, at NOTICE: it is not a fault, but an
+	// operator who never sees a strand report should be able to find out that
+	// the detector cannot see one here rather than infer that all is well.
+	for _, u := range undecided {
+		if !slices.Contains(c.prStrandUndecided, u) {
+			log.Printf("NOTICE: cannot determine whether a reservation is stranded: %s", u)
+		}
+	}
+	c.prStrandUndecided = undecided
 }
 
 // storePRUnboundLocked and storeDriftLocked hold the newly-seen logging so it
@@ -1128,7 +1145,8 @@ func (c *Coordinator) HealthSnapshot() Health {
 	c.healthMu.Lock()
 	defer c.healthMu.Unlock()
 	h := Health{PRUnbound: slices.Clone(c.prUnbound), PRStranded: slices.Clone(c.prStranded),
-		Drift: slices.Clone(c.drift), CheckedAt: c.prCheckedAt}
+		PRStrandUndecided: slices.Clone(c.prStrandUndecided),
+		Drift:             slices.Clone(c.drift), CheckedAt: c.prCheckedAt}
 	h.PortalFlagIgnored = c.portalFlagIgnored
 	h.IQNFlagIgnored = c.iqnFlagIgnored
 	// Read from the store rather than mirrored into a coordinator field: it is
@@ -1178,7 +1196,8 @@ func (c *Coordinator) RecheckPR() {
 	}
 	defer c.mu.Unlock()
 	desired := c.desiredLIO()
-	c.publishPRCheck(c.lio.VerifyAPTPL(desired), strandedText(c.lio.StrandedReservations(desired)))
+	stranded, undecided := strandedText(c.lio.StrandedReservations(desired))
+	c.publishPRCheck(c.lio.VerifyAPTPL(desired), stranded, undecided)
 }
 
 // Healthy reports whether the kernel LIO tree is in sync with the db. It is
@@ -1431,13 +1450,20 @@ func wildcardCovers(w, other netip.Addr) bool {
 }
 
 // strandedText renders stranded reservations for the report channel.
-func strandedText(in []lio.StrandedReservation) []string {
-	if len(in) == 0 {
-		return nil
+// strandedText renders a strand report into the two health fields it feeds:
+// the reservations proven stranded, and the targets where that question could
+// not be answered at all.
+//
+// Kept separate deliberately. The first is a condition an operator may need to
+// act on; the second says the detector is blind, which is a statement about
+// this appliance rather than about the storage, and must not be dressed up as
+// a fencing problem.
+func strandedText(rep lio.StrandReport) (stranded, undecided []string) {
+	for _, s := range rep.Stranded {
+		stranded = append(stranded, s.String())
 	}
-	out := make([]string, 0, len(in))
-	for _, s := range in {
-		out = append(out, s.String())
+	for _, u := range rep.Undecided {
+		undecided = append(undecided, u.String())
 	}
-	return out
+	return stranded, undecided
 }

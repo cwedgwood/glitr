@@ -54,6 +54,15 @@ func Handler(c *Coordinator) http.Handler {
 		if len(h.PRStranded) > 0 {
 			body["pr_stranded"] = h.PRStranded
 		}
+		// Deliberately NOT part of the warning verdict below. This says the
+		// appliance cannot answer the strand question for these volumes --
+		// normal under multipath, where the kernel renders one session per ACL
+		// and an initiator holds several. Reporting it as a warning is exactly
+		// the false alarm it replaces; hiding it would let a detector go blind
+		// in silence.
+		if len(h.PRStrandUndecided) > 0 {
+			body["pr_strand_undecided"] = h.PRStrandUndecided
+		}
 		// Managed attributes the kernel refused to change while the volume is
 		// exported. Reported for the same reason as pr_unbound: the tree is
 		// consistent, so this is not "degraded", but the live device does not
