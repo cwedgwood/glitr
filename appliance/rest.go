@@ -145,17 +145,16 @@ func Handler(c *Coordinator) http.Handler {
 		// restart a working daemon -- which does not restore the reservation
 		// and does interrupt the volumes that are fine. The status code
 		// answers "is it running", the status field answers "is it right".
-		switch {
-		case h.Degraded:
-			body["status"] = "degraded"
+		// The verdict itself is Health.Status, shared with the transition
+		// event so the log and this endpoint cannot disagree about what the
+		// appliance is. Only the status CODE is decided here.
+		status := h.Status()
+		body["status"] = status
+		switch status {
+		case healthDegraded:
 			body["error"] = h.Detail
 			writeJSON(w, http.StatusServiceUnavailable, body)
-		case len(h.Withheld) > 0 || h.ClearInProgress != "" ||
-			len(h.PRUnbound) > 0 || len(h.PRStranded) > 0:
-			body["status"] = "warning"
-			writeJSON(w, http.StatusOK, body)
 		default:
-			body["status"] = "ok"
 			writeJSON(w, http.StatusOK, body)
 		}
 	})

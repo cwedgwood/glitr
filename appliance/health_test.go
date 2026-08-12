@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -56,9 +57,9 @@ func TestHealthSnapshotIsAtomic(t *testing.T) {
 			default:
 			}
 			if i%2 == 0 {
-				c.publishReconcile(nil, []string{"vol_a: not in effect"}, nil, nil, nil)
+				c.publishReconcile(context.Background(), nil, []string{"vol_a: not in effect"}, nil, nil, nil)
 			} else {
-				c.publishReconcile(errors.New("reconcile failed"), nil, nil, nil, nil)
+				c.publishReconcile(context.Background(), errors.New("reconcile failed"), nil, nil, nil, nil)
 			}
 		}
 	})
@@ -94,7 +95,7 @@ func TestRecheckPRSkipsWhenBusy(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.RecheckPR() // must return immediately, not block on c.mu
+		c.RecheckPR(context.Background()) // must return immediately, not block on c.mu
 		close(done)
 	}()
 
@@ -204,7 +205,7 @@ func TestHealthCheckedAtDiscriminatesWithinASecond(t *testing.T) {
 // before.
 func TestStrandedReservationIsReportedButNotDegraded(t *testing.T) {
 	c := &Coordinator{}
-	c.publishReconcile(nil, nil, []string{
+	c.publishReconcile(context.Background(), nil, nil, []string{
 		"backstore/fileio/vol_x: reservation held by iqn.1993-08.org.debian:01:a " +
 			"cannot be released by it",
 	}, nil, nil)
@@ -270,7 +271,7 @@ func TestHealthReportsFencingSignalsOnEveryPath(t *testing.T) {
 		c := &Coordinator{}
 		// Through the production publisher, not by setting fields: a test that
 		// stages state its own way can pass while the real path is broken.
-		c.publishReconcile(nil, []string{"vol0: saved registration did not bind"}, nil, nil, nil)
+		c.publishReconcile(context.Background(), nil, []string{"vol0: saved registration did not bind"}, nil, nil, nil)
 		code, body := get(c)
 		if body["status"] == "ok" {
 			t.Error("a reservation that is not in effect was reported as status ok")
@@ -292,10 +293,10 @@ func TestHealthReportsFencingSignalsOnEveryPath(t *testing.T) {
 		// sequence: publishReconcileFailure deliberately keeps the previous
 		// warnings because a failed reconcile learned nothing new about
 		// fencing.
-		c.publishReconcile(nil,
+		c.publishReconcile(context.Background(), nil,
 			[]string{"vol0: saved registration did not bind"},
 			[]string{"vol1: holder cannot release"}, nil, nil)
-		c.publishReconcileFailure(errors.New("reconcile failed"))
+		c.publishReconcileFailure(context.Background(), errors.New("reconcile failed"))
 		code, body := get(c)
 		if code != http.StatusServiceUnavailable {
 			t.Errorf("status code %d, want 503", code)
@@ -323,7 +324,7 @@ func TestHealthReportsFencingSignalsOnEveryPath(t *testing.T) {
 // attention-getting signal.
 func TestUndecidedStrandIsNotAWarning(t *testing.T) {
 	c := &Coordinator{}
-	c.publishReconcile(nil, nil, nil,
+	c.publishReconcile(context.Background(), nil, nil, nil,
 		[]string{"iqn.x:t: cannot tell whether these reservations are stranded — " +
 			"the kernel reports 8 live sessions but renders only 1"}, nil)
 

@@ -305,6 +305,12 @@ type Coordinator struct {
 	// exactly when a reconcile is wedged in the kernel.
 	lastReconcileErr error
 	healthMu         sync.Mutex
+	// lastStatus and lastConditions are the previously published health
+	// verdict and condition set, for edge detection. Guarded by healthMu. An
+	// empty lastStatus means nothing has been published yet, which is
+	// deliberately not treated as a transition.
+	lastStatus     string
+	lastConditions []string
 	// backupErr remembers a failure to keep a db backup. Guarded by healthMu.
 	backupErr error
 	healthErr error
@@ -1147,18 +1153,25 @@ func (c *Coordinator) restoreState(b db) { c.st = b }
 // fencing state -- the full path through Sync, the incremental path through
 // VerifyAPTPL -- so leaving it to the periodic checker alone under-reported
 // the freshness of a fact that had just been established.
-func (c *Coordinator) publishReconcile(err error, unbound, stranded, undecided []string, drift []lio.AttrDrift) {
+func (c *Coordinator) publishReconcile(ctx context.Context, err error, unbound, stranded, undecided []string, drift []lio.AttrDrift) {
 	rendered := make([]string, 0, len(drift))
 	for _, d := range drift {
 		rendered = append(rendered, d.String())
 	}
-	c.healthMu.Lock()
-	defer c.healthMu.Unlock()
-	c.healthErr = err
-	c.storePRUnboundLocked(unbound)
-	c.storePRStrandedLocked(stranded, undecided)
-	c.storeDriftLocked(rendered)
-	c.prCheckedAt = time.Now()
+	func() {
+		c.healthMu.Lock()
+		defer c.healthMu.Unlock()
+		c.healthErr = err
+		c.storePRUnboundLocked(unbound)
+		c.storePRStrandedLocked(stranded, undecided)
+		c.storeDriftLocked(rendered)
+		c.prCheckedAt = time.Now()
+	}()
+	// After the lock, not inside it: the check takes a snapshot, which takes
+	// healthMu itself. Publishing one generation and then reporting the edge
+	// is also the right order -- the event describes what a reader would now
+	// see on /health.
+	c.noteHealth(ctx)
 }
 
 // publishReconcileFailure records a failed reconcile without touching the
@@ -1169,20 +1182,24 @@ func (c *Coordinator) publishReconcile(err error, unbound, stranded, undecided [
 // drift, and inventing "none" would be the fail-open direction. Pairing a
 // fresh degraded verdict with older warnings is honest and is the loud
 // direction -- degraded already tells the operator not to trust the rest.
-func (c *Coordinator) publishReconcileFailure(err error) {
+func (c *Coordinator) publishReconcileFailure(ctx context.Context, err error) {
 	c.healthMu.Lock()
-	defer c.healthMu.Unlock()
 	c.healthErr = err
+	c.healthMu.Unlock()
+	c.noteHealth(ctx)
 }
 
 // publishPRCheck publishes a periodic fencing re-verification: the warnings
 // and their timestamp together, so a reader cannot see one without the other.
-func (c *Coordinator) publishPRCheck(unbound, stranded, undecided []string) {
-	c.healthMu.Lock()
-	defer c.healthMu.Unlock()
-	c.storePRUnboundLocked(unbound)
-	c.storePRStrandedLocked(stranded, undecided)
-	c.prCheckedAt = time.Now()
+func (c *Coordinator) publishPRCheck(ctx context.Context, unbound, stranded, undecided []string) {
+	func() {
+		c.healthMu.Lock()
+		defer c.healthMu.Unlock()
+		c.storePRUnboundLocked(unbound)
+		c.storePRStrandedLocked(stranded, undecided)
+		c.prCheckedAt = time.Now()
+	}()
+	c.noteHealth(ctx)
 }
 
 // storePRStrandedLocked logs each newly-seen stranded reservation once.
@@ -1359,14 +1376,14 @@ func (c *Coordinator) HealthSnapshot() Health {
 // Skips the tick rather than waiting when a mutation holds c.mu: that
 // reconcile publishes its own fresher result on the way out, so blocking here
 // would only queue goroutines behind a lock that may be wedged in the kernel.
-func (c *Coordinator) RecheckPR() {
+func (c *Coordinator) RecheckPR(ctx context.Context) {
 	if !c.mu.TryLock() {
 		return
 	}
 	defer c.mu.Unlock()
 	desired := c.desiredLIO()
 	stranded, undecided := strandedText(c.lio.StrandedReservations(desired))
-	c.publishPRCheck(c.lio.VerifyAPTPL(desired), stranded, undecided)
+	c.publishPRCheck(ctx, c.lio.VerifyAPTPL(desired), stranded, undecided)
 }
 
 // Healthy reports whether the kernel LIO tree is in sync with the db. It is
@@ -1386,10 +1403,33 @@ func (c *Coordinator) Healthy() (bool, string) {
 }
 
 // setReconcileErr records the reconcile outcome for both the mutation gate
-// (under mu) and /health (under healthMu).
-func (c *Coordinator) setReconcileErr(err error) {
+// (under mu) and /health (under healthMu), and reports its edge.
+//
+// The logging lives HERE, with the assignment, rather than at the call site.
+// Recording a failure and announcing it are the same event, and separating
+// them means a future path that records one can silently forget to say so --
+// which is what a test found when this was wired the other way round.
+func (c *Coordinator) setReconcileErr(ctx context.Context, err error, kind string, rep lio.Report) {
+	prev := c.lastReconcileErr
 	c.lastReconcileErr = err
-	c.publishReconcileFailure(err)
+	c.publishReconcileFailure(ctx, err)
+	c.logReconcileOutcome(ctx, prev, err, kind, rep)
+}
+
+// setReconcileOK is the success counterpart: it clears the verdict, publishes
+// one generation of health facts, and reports the FALLING edge.
+//
+// Symmetric with setReconcileErr on purpose. The recovery used to be logged by
+// the caller, which meant the falling edge -- the whole justification for the
+// event -- depended on each reconcile path remembering to ask for it. Caller
+// must hold c.mu.
+func (c *Coordinator) setReconcileOK(ctx context.Context, kind string, rep lio.Report,
+	unbound, stranded, undecided []string, drift []lio.AttrDrift) {
+
+	prev := c.lastReconcileErr
+	c.lastReconcileErr = nil
+	c.publishReconcile(ctx, nil, unbound, stranded, undecided, drift)
+	c.logReconcileOutcome(ctx, prev, nil, kind, rep)
 }
 
 // reconcileOutcomeOf maps a reconcile error to a reconcile_outcome value.
