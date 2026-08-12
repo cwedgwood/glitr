@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -55,7 +56,7 @@ type ReinitOptions struct {
 //
 // The daemon must not be running: this rewrites the database underneath it.
 // The caller holds the host lock -- see cmd/applianced.
-func Reinit(opts ReinitOptions) error {
+func Reinit(opts ReinitOptions) (err error) {
 	if opts.Root == "" {
 		return errors.New("appliance: reinit needs a data root (-root)")
 	}
@@ -101,6 +102,10 @@ func Reinit(opts ReinitOptions) error {
 		c.st.Exports = map[string]int{}
 	}
 
+	ev := c.beginOp(context.Background(), eventTargetReinit,
+		"root", opts.Root, "wipe", opts.Wipe)
+	defer func() { ev.finish(err) }()
+
 	was := c.st.MachineID
 	if was == "" {
 		was = "(none recorded)"
@@ -128,7 +133,7 @@ func Reinit(opts ReinitOptions) error {
 	}
 
 	c.st.TargetIQN, c.st.MachineID = iqn, machineID
-	if err := c.persist(); err != nil && !errors.Is(err, errPersistedNotDurable) {
+	if err := c.persist(context.Background(), ev); err != nil && !errors.Is(err, errPersistedNotDurable) {
 		return fmt.Errorf("appliance: writing the re-initialised database: %w", err)
 	}
 	fmt.Fprintf(out, "done. Start the appliance normally.\n")

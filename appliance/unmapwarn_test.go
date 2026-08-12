@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -316,7 +317,7 @@ func TestLastAttachmentSaysTheReservationMayReturn(t *testing.T) {
 func TestUnmapWarningSurvivesACommitFailure(t *testing.T) {
 	c, v := stageHolder(t, "iqn.x:holder")
 
-	warning, err := c.Disconnect(KindVolume, v.UUID, hHolder)
+	warning, err := c.Disconnect(context.Background(), KindVolume, v.UUID, hHolder)
 	if err == nil {
 		t.Fatal("this fixture must fail in reconcile, or it is not testing the path")
 	}
@@ -363,7 +364,7 @@ const (
 // object exists now: the record and the bytes are committed together.
 func mustObject(t *testing.T, c *Coordinator, name string, size int64) Object {
 	t.Helper()
-	o, _, err := c.Create(KindVolume, CreateRequest{Name: name, Size: size})
+	o, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: name, Size: size})
 	if err != nil {
 		t.Fatalf("creating %q: %v", name, err)
 	}

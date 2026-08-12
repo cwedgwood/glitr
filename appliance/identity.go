@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -192,7 +193,7 @@ func (c *Coordinator) adoptIdentity() error {
 	// The effective identity, so every reader below sees what was decided here
 	// rather than what the flag said.
 	c.cfg.TargetIQN = iqn
-	if err := c.persist(); err != nil {
+	if err := c.persist(context.Background(), nil); err != nil {
 		return fmt.Errorf("appliance: recording the target identity: %w", err)
 	}
 	if actual == "" {

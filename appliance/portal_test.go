@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,7 +148,7 @@ func TestSamePortalSetIsOrderIndependent(t *testing.T) {
 func TestSetPortalsRefusesToRemoveEveryPortal(t *testing.T) {
 	t.Chdir(t.TempDir()) // so a stray write lands somewhere disposable
 	c := &Coordinator{cfg: Config{TargetIQN: "iqn.2026-01.dev.glitr:t"}}
-	if _, err := c.SetPortals(nil); err == nil {
+	if _, err := c.SetPortals(context.Background(), nil); err == nil {
 		t.Fatal("accepted an empty portal list")
 	} else if !strings.Contains(err.Error(), "every portal") {
 		t.Errorf("refusal does not explain itself: %v", err)
@@ -157,7 +158,7 @@ func TestSetPortalsRefusesToRemoveEveryPortal(t *testing.T) {
 	// GUARD. It fails later here (a bare Coordinator has no database path),
 	// so assert on which failure it is, not merely that one happened.
 	p, _ := lio.ParsePortal("10.10.0.1:3260")
-	if _, err := c.SetPortals([]lio.Portal{p}); err != nil &&
+	if _, err := c.SetPortals(context.Background(), []lio.Portal{p}); err != nil &&
 		strings.Contains(err.Error(), "every portal") {
 		t.Errorf("the empty-list guard fired on a one-portal list: %v", err)
 	}
@@ -258,7 +259,7 @@ func TestPersistRefusesAnEmptyDBPath(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	err := (&Coordinator{}).persist()
+	err := (&Coordinator{}).persist(context.Background(), nil)
 	if err == nil {
 		t.Fatal("persist() with an empty dbPath returned no error")
 	}
@@ -334,7 +335,7 @@ func TestTargetIsSafeUnderConcurrentSetPortals(t *testing.T) {
 	// it takes c.mu and mutates c.st.Portals on the way, and that is the
 	// write this test races against.
 	for i := range 60 {
-		_, _ = c.SetPortals([]lio.Portal{{IP: mustAddr("10.0.0.2"), Port: uint16(3260 + i%3)}})
+		_, _ = c.SetPortals(context.Background(), []lio.Portal{{IP: mustAddr("10.0.0.2"), Port: uint16(3260 + i%3)}})
 	}
 	close(stop)
 	wg.Wait()

@@ -36,12 +36,14 @@
 package appliance
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/netip"
@@ -195,6 +197,16 @@ type Config struct {
 	// return space and others do not is a fleet whose free-space arithmetic
 	// nobody can do.
 	NoUnmap bool `json:"no_unmap"`
+
+	// Logger receives the appliance's structured events. Nil means
+	// [slog.Default], which is what applog.Install sets, so a daemon gets the
+	// configured handler without passing it twice.
+	//
+	// A field rather than a package-level variable because two coordinators
+	// exist in the same process in tests, and a test that asserts on events
+	// must be able to read its own without racing another's. Not serialised:
+	// this is wiring, not configuration.
+	Logger *slog.Logger `json:"-"`
 }
 
 // Coordinator is the single-writer control plane.
@@ -205,6 +217,8 @@ type Coordinator struct {
 	cfg    Config
 	dbPath string
 	st     db
+	// log receives structured events. Never nil after Open; see Config.Logger.
+	log *slog.Logger
 	// applied is the desired config the kernel was last successfully
 	// reconciled to, and is what an incremental reconcile diffs against. nil
 	// means "unknown" -- at startup, or after any failure -- which forces the
@@ -388,8 +402,16 @@ func Open(root string, store *storage.Store, m *lio.Manager, cfg Config) (*Coord
 		store:  store,
 		lio:    m,
 		cfg:    cfg,
+		log:    cfg.Logger,
 		dbPath: filepath.Join(root, "appliance.json"),
 		st:     db{Version: dbVersion, Exports: map[string]int{}},
+	}
+	if c.log == nil {
+		// Resolved once, here, rather than at every call site: reading
+		// slog.Default() per event would silently change destination
+		// mid-flight if anything reset it, and an event stream that moves is
+		// worse than one that is wired wrong from the start.
+		c.log = slog.Default()
 	}
 	existed, err := c.load()
 	if err != nil {
@@ -411,9 +433,14 @@ func Open(root string, store *storage.Store, m *lio.Manager, cfg Config) (*Coord
 	if err := c.adoptPortals(); err != nil {
 		return nil, err
 	}
-	if _, err := c.reconcile(); err != nil {
+	// Startup replay. Its own event, because "what did the kernel need fixing
+	// after that reboot" is a different question from any request, and until
+	// now the answer was computed and thrown away.
+	rep, err := c.reconcile(context.Background())
+	if err != nil {
 		return nil, err
 	}
+	c.logReplayApplied(context.Background(), rep)
 	c.logOrphanPRState()
 	return c, nil
 }
@@ -440,7 +467,7 @@ func Open(root string, store *storage.Store, m *lio.Manager, cfg Config) (*Coord
 func (c *Coordinator) adoptPortals() error {
 	if len(c.st.Portals) == 0 {
 		c.st.Portals = slices.Clone(c.cfg.Portals)
-		if err := c.persist(); err != nil {
+		if err := c.persist(context.Background(), nil); err != nil {
 			return fmt.Errorf("recording the initial portal list: %w", err)
 		}
 		return nil
@@ -826,7 +853,7 @@ func validUUID(s string) bool {
 	return true
 }
 
-func (c *Coordinator) persist() error {
+func (c *Coordinator) persist(ctx context.Context, op *opLog) error {
 	// Refuse rather than write relative to the process's working directory.
 	// The temp file is c.dbPath+".tmp", so an empty dbPath makes that ".tmp"
 	// in whatever directory the process happens to be in; the rename to ""
@@ -886,13 +913,21 @@ func (c *Coordinator) persist() error {
 	// and a stale alarm on a resolved condition is how a real one gets
 	// ignored. Set and cleared in one place so the two cannot drift.
 	c.healthMu.Lock()
+	prevBackupErr := c.backupErr
 	c.backupErr = backupErr
+	c.logBackupPosture(ctx, prevBackupErr, backupErr)
 	c.healthMu.Unlock()
+	// The rename has happened, so the change is in effect from here on. Say so
+	// before the fsync is attempted rather than after it: if the fsync fails,
+	// this is still true, and it is the fact a caller most needs.
+	op.noteCommit(true, false)
 	if err := syncDir(filepath.Dir(c.dbPath)); err != nil {
 		// The rename already made the new db visible, so the ON-DISK state is
 		// the NEW state; the caller must not roll memory back to the old one.
+		c.logNotDurable(ctx, err)
 		return fmt.Errorf("%w: %v", errPersistedNotDurable, err)
 	}
+	op.noteCommit(true, true)
 	return nil
 }
 
@@ -949,7 +984,7 @@ func (c *Coordinator) snapshotState() db {
 // just commit(): if a detach persisted but its reconcile failed, the db shows no
 // attachment while the kernel still holds a live LUN with an open fd on the
 // backing file — deleting that file would destroy data still being served.
-func (c *Coordinator) healIfDegraded() error {
+func (c *Coordinator) healIfDegraded(ctx context.Context) error {
 	if c.lastReconcileErr == nil {
 		return nil
 	}
@@ -958,7 +993,7 @@ func (c *Coordinator) healIfDegraded() error {
 	// reconcile() has nothing to diff against and falls back to Sync. Healing
 	// must rediscover the tree rather than trust a belief formed before the
 	// failure.
-	if _, err := c.reconcile(); err != nil {
+	if _, err := c.reconcile(ctx); err != nil {
 		return statusErr(http.StatusServiceUnavailable, "appliance degraded: previous reconcile failed (%v); "+
 			"retry once the kernel LIO state is reachable", err)
 	}
@@ -987,13 +1022,13 @@ func (c *Coordinator) healIfDegraded() error {
 //
 // Still serialised under c.mu and still rolled back on failure. Caller must
 // hold c.mu.
-func (c *Coordinator) persistOnly(mutate func() error) error {
+func (c *Coordinator) persistOnly(ctx context.Context, op *opLog, mutate func() error) error {
 	backup := c.snapshotState()
 	if err := mutate(); err != nil {
 		c.restoreState(backup)
 		return err
 	}
-	if err := c.persist(); err != nil {
+	if err := c.persist(ctx, op); err != nil {
 		if errors.Is(err, errPersistedNotDurable) {
 			// Already on disk; keep memory in step with it rather than
 			// diverging, exactly as commit does.
@@ -1005,14 +1040,14 @@ func (c *Coordinator) persistOnly(mutate func() error) error {
 	return nil
 }
 
-func (c *Coordinator) commit(mutate func() error) error {
+func (c *Coordinator) commit(ctx context.Context, op *opLog, mutate func() error) error {
 	tCommit := time.Now()
 	// If the previous reconcile left the kernel out of sync with the db, heal
 	// it before accepting a new mutation. Otherwise a mutation computed against
 	// a stale kernel — e.g. an export index freed by a failed detach and then
 	// reused for a different volume — could apply a disruptive in-place change.
 	// Refuse the mutation if the kernel still can't be reconciled.
-	if err := c.healIfDegraded(); err != nil {
+	if err := c.healIfDegraded(ctx); err != nil {
 		return err
 	}
 	backup := c.snapshotState()
@@ -1025,10 +1060,11 @@ func (c *Coordinator) commit(mutate func() error) error {
 		return err
 	}
 	tPersist := time.Now()
-	if err := c.persist(); err != nil {
+	if err := c.persist(ctx, op); err != nil {
 		if errors.Is(err, errPersistedNotDurable) {
 			// Already on disk — reconcile it rather than diverging from it.
-			_, _ = c.reconcile()
+			_, rerr := c.reconcile(ctx)
+			op.noteReconcile(reconcileOutcomeOf(rerr))
 			return err
 		}
 		c.restoreState(backup)
@@ -1036,7 +1072,8 @@ func (c *Coordinator) commit(mutate func() error) error {
 	}
 	persistFor := time.Since(tPersist)
 	tRec := time.Now()
-	_, err := c.reconcile()
+	_, err := c.reconcile(ctx)
+	op.noteReconcile(reconcileOutcomeOf(err))
 	reconcileFor := time.Since(tRec)
 
 	// This spans the whole of commit, which is held under c.mu and is
@@ -1340,6 +1377,14 @@ func (c *Coordinator) Healthy() (bool, string) {
 func (c *Coordinator) setReconcileErr(err error) {
 	c.lastReconcileErr = err
 	c.publishReconcileFailure(err)
+}
+
+// reconcileOutcomeOf maps a reconcile error to a reconcile_outcome value.
+func reconcileOutcomeOf(err error) string {
+	if err != nil {
+		return reconcileFailed
+	}
+	return reconcileSucceeded
 }
 
 // --- helpers (caller must hold c.mu) ---

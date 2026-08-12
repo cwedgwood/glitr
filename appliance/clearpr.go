@@ -1,13 +1,14 @@
 package appliance
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"net/http"
 	"os"
 
+	"github.com/cwedgwood/glitr/applog"
 	"github.com/cwedgwood/glitr/lio"
 )
 
@@ -121,7 +122,10 @@ var errClearVerify = errors.New("reservation still held after clear")
 // object has no reservation afterwards, and refusing would make the operation
 // useless for clearing leftover REGISTRATIONS, which are torn down by the same
 // path and are what a pr_unbound report is about.
-func (c *Coordinator) ClearReservation(kind Kind, ref, confirm string) (ClearedReservation, error) {
+func (c *Coordinator) ClearReservation(ctx context.Context, kind Kind, ref, confirm string) (res ClearedReservation, err error) {
+	ev := c.beginOp(ctx, eventPRCleared, "resource_kind", string(kind), "ref", ref)
+	defer func() { ev.finish(err) }()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -148,7 +152,7 @@ func (c *Coordinator) ClearReservation(kind Kind, ref, confirm string) (ClearedR
 	// exempt: a clear is a recovery operation, but recovering onto a tree we
 	// know is wrong is how a clear ends up destroying the wrong object's
 	// fencing.
-	if err := c.healIfDegraded(); err != nil {
+	if err := c.healIfDegraded(ctx); err != nil {
 		return ClearedReservation{}, err
 	}
 
@@ -187,9 +191,11 @@ func (c *Coordinator) ClearReservation(kind Kind, ref, confirm string) (ClearedR
 		}
 	}
 
-	log.Printf("clearing SCSI-3 reservation on %s %q (wwn %s): holder=%q isid=%q type=%q "+
-		"-- initiators will see the device disappear and return",
-		kind, v.Name, v.WWN, out.Holder, out.ISID, out.Type)
+	ev.set("resource_name", v.Name, "resource_id", v.UUID, "wwn", v.WWN)
+	applog.Warn(ctx, c.logger(), eventPRClearing,
+		"clearing a SCSI-3 reservation; initiators will see the device disappear and return",
+		"resource_kind", string(kind), "resource_name", v.Name, "resource_id", v.UUID,
+		"wwn", v.WWN, "holder", out.Holder, "isid", out.ISID, "reservation_type", out.Type)
 
 	// Say so on /health for the duration. Everything below runs under mu,
 	// which /health does not take, so without this a monitor reads the
@@ -206,9 +212,9 @@ func (c *Coordinator) ClearReservation(kind Kind, ref, confirm string) (ClearedR
 	// Phase 1: withhold the object and reconcile. This prunes the backstore,
 	// which is what frees the registrations.
 	c.prClearing = uuid
-	_, pruneErr := c.reconcile()
+	_, pruneErr := c.reconcile(ctx)
 	if pruneErr != nil {
-		return c.recoverFromFailedPrune(out, kind, v.Name, uuid, pruneErr)
+		return c.recoverFromFailedPrune(ctx, out, kind, v.Name, uuid, pruneErr)
 	}
 
 	// Phase 2: discard the saved record, now that no initiator can reach the
@@ -269,7 +275,7 @@ func (c *Coordinator) ClearReservation(kind Kind, ref, confirm string) (ClearedR
 	// missing, which is the loud direction and is what healIfDegraded exists
 	// for -- it will retry on the next mutation.
 	c.prClearing = ""
-	if _, err := c.reconcile(); err != nil {
+	if _, err := c.reconcile(ctx); err != nil {
 		// Do not assert the object is absent: ApplyDelta is fail-stop and NOT
 		// transactional, so a partial rebuild can leave it absent, partly
 		// built, or present. Classify what can actually be established, and
@@ -313,8 +319,8 @@ func (c *Coordinator) ClearReservation(kind Kind, ref, confirm string) (ClearedR
 		"relied on for fencing is gone. Every REGISTRATION on this device was " +
 		"freed too, not just the holder's, so every node that had registered a " +
 		"key must re-register before it can fence again")
-	log.Printf("cleared SCSI-3 reservation on %s %q (saved record discarded: %t)",
-		kind, v.Name, out.SavedRecordDiscarded)
+	ev.set("saved_record_discarded", out.SavedRecordDiscarded,
+		"held", out.Held, "held_known", out.HeldKnown, "holder", out.Holder)
 	return out, nil
 }
 
@@ -529,14 +535,14 @@ func (c *Coordinator) verifyCleared(objectUUID string, kind Kind, name string) e
 // "the fence is still up" and proceeds on that belief, which is the
 // under-fencing direction the project forbids. So the state is re-read and the
 // error says which of the two happened.
-func (c *Coordinator) recoverFromFailedPrune(out ClearedReservation, kind Kind,
+func (c *Coordinator) recoverFromFailedPrune(ctx context.Context, out ClearedReservation, kind Kind,
 	name, objectUUID string, pruneErr error) (ClearedReservation, error) {
 
 	// Put it back first. Losing the volume is far worse than failing to drop
 	// a fence, and the re-read below is only meaningful against a rebuilt
 	// tree anyway.
 	c.prClearing = ""
-	if _, err := c.reconcile(); err != nil {
+	if _, err := c.reconcile(ctx); err != nil {
 		out.addWarning(fmt.Sprintf(
 			"%s %q is NOT presented to its initiators after a failed clear, and "+
 				"whether its reservation survived could not be established; do "+

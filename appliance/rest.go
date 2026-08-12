@@ -1,13 +1,14 @@
 package appliance
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
-	"github.com/cwedgwood/glitr/applog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/cwedgwood/glitr/applog"
 	"github.com/cwedgwood/glitr/lio"
 )
 
@@ -195,7 +196,7 @@ func Handler(c *Coordinator) http.Handler {
 		// malformed address -- a true statement about the wrong thing, and it
 		// buries the actual reason the request is refused.
 		if len(req.Portals) == 0 {
-			_, err := c.SetPortals(nil)
+			_, err := c.SetPortals(opCtx(r), nil)
 			respond(w, nil, http.StatusOK, err)
 			return
 		}
@@ -204,7 +205,7 @@ func Handler(c *Coordinator) http.Handler {
 			errResp(w, http.StatusBadRequest, perr.Error())
 			return
 		}
-		out, err := c.SetPortals(parsed)
+		out, err := c.SetPortals(opCtx(r), parsed)
 		respond(w, map[string]any{"portals": out}, http.StatusOK, err)
 	})
 
@@ -233,7 +234,7 @@ func Handler(c *Coordinator) http.Handler {
 			}
 			cr := CreateRequest{Name: req.Name, Size: req.Size, BlockSize: req.BlockSize,
 				Source: req.Source, SourceKind: sourceKind(kind, req.SourceKind)}
-			o, created, err := c.Create(kind, cr)
+			o, created, err := c.Create(opCtx(r), kind, cr)
 			respond(w, o, createdCode(created), err)
 		})
 
@@ -258,12 +259,12 @@ func Handler(c *Coordinator) http.Handler {
 			if !readJSON(w, r, &req) {
 				return
 			}
-			o, err := c.Rename(kind, r.PathValue("name"), req.Name)
+			o, err := c.Rename(opCtx(r), kind, r.PathValue("name"), req.Name)
 			respond(w, o, http.StatusOK, err)
 		})
 
 		mux.HandleFunc("DELETE /"+coll+"/{name}", func(w http.ResponseWriter, r *http.Request) {
-			err := c.Delete(kind, r.PathValue("name"))
+			err := c.Delete(opCtx(r), kind, r.PathValue("name"))
 			respond(w, map[string]string{"deleted": r.PathValue("name")}, http.StatusOK, err)
 		})
 
@@ -274,7 +275,7 @@ func Handler(c *Coordinator) http.Handler {
 			if !readJSON(w, r, &req) {
 				return
 			}
-			rescan, err := c.Resize(kind, r.PathValue("name"), req.Size)
+			rescan, err := c.Resize(opCtx(r), kind, r.PathValue("name"), req.Size)
 			respond(w, map[string]bool{"rescan_required": rescan}, http.StatusOK, err)
 		})
 
@@ -297,7 +298,7 @@ func Handler(c *Coordinator) http.Handler {
 			if !readJSON(w, r, &req) {
 				return
 			}
-			out, err := c.ClearReservation(kind, r.PathValue("name"), req.Confirm)
+			out, err := c.ClearReservation(opCtx(r), kind, r.PathValue("name"), req.Confirm)
 			respondCleared(w, out, err)
 		})
 
@@ -314,12 +315,12 @@ func Handler(c *Coordinator) http.Handler {
 			if given {
 				lun = *req.LUN
 			}
-			info, created, err := c.Connect(kind, r.PathValue("name"), req.Host, lun, given)
+			info, created, err := c.Connect(opCtx(r), kind, r.PathValue("name"), req.Host, lun, given)
 			respond(w, info, createdCode(created), err)
 		})
 
 		mux.HandleFunc("DELETE /"+coll+"/{name}/connections/{host}", func(w http.ResponseWriter, r *http.Request) {
-			warning, err := c.Disconnect(kind, r.PathValue("name"), r.PathValue("host"))
+			warning, err := c.Disconnect(opCtx(r), kind, r.PathValue("name"), r.PathValue("host"))
 			// The warning rides on BOTH paths: a reconcile failure inside
 			// commit lands after the disconnect is durable, so the fence is
 			// already lost and the caller still has to be told.
@@ -354,7 +355,7 @@ func Handler(c *Coordinator) http.Handler {
 		if !readJSON(w, r, &req) {
 			return
 		}
-		h, created, err := c.CreateHost(req.Name, req.IQNs)
+		h, created, err := c.CreateHost(opCtx(r), req.Name, req.IQNs)
 		respond(w, h, createdCode(created), err)
 	})
 
@@ -378,7 +379,7 @@ func Handler(c *Coordinator) http.Handler {
 		if !readJSON(w, r, &req) {
 			return
 		}
-		h, err := c.RenameHost(r.PathValue("name"), req.Name)
+		h, err := c.RenameHost(opCtx(r), r.PathValue("name"), req.Name)
 		respond(w, h, http.StatusOK, err)
 	})
 
@@ -396,7 +397,7 @@ func Handler(c *Coordinator) http.Handler {
 		if req.IQNs == nil {
 			req.IQNs = []string{}
 		}
-		h, warning, err := c.SetBindings(r.PathValue("name"), req.IQNs, nil, nil)
+		h, warning, err := c.SetBindings(opCtx(r), r.PathValue("name"), req.IQNs, nil, nil)
 		respondWithWarning(w, map[string]any{"host": h}, warning, err)
 	})
 
@@ -408,13 +409,13 @@ func Handler(c *Coordinator) http.Handler {
 		if !readJSON(w, r, &req) {
 			return
 		}
-		h, warning, err := c.SetBindings(r.PathValue("name"), nil, req.Add, req.Remove)
+		h, warning, err := c.SetBindings(opCtx(r), r.PathValue("name"), nil, req.Add, req.Remove)
 		respondWithWarning(w, map[string]any{"host": h}, warning, err)
 	})
 
 	mux.HandleFunc("DELETE /hosts/{name}", func(w http.ResponseWriter, r *http.Request) {
 		respond(w, map[string]string{"deleted": r.PathValue("name")}, http.StatusOK,
-			c.DeleteHost(r.PathValue("name")))
+			c.DeleteHost(opCtx(r), r.PathValue("name")))
 	})
 
 	mux.HandleFunc("GET /hosts/{name}/connections", func(w http.ResponseWriter, r *http.Request) {
@@ -458,6 +459,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 func errResp(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg, "code": codeForStatus(code)})
 }
+
+// opCtx derives the context an operation runs under from its request.
+//
+// The derivation is the point, not a formality. r.Context() is cancelled when
+// the client goes away, and the operations below write to configfs, which
+// blocks uncancellably in the kernel -- so passing the request's own context
+// would advertise a cancellation that cannot happen and, worse, invite future
+// code to act on it halfway through a reconcile. applog.Observability keeps
+// the values, including the request id, and drops the cancellation. It is the
+// only supported way to hand a request-scoped context to the coordinator.
+func opCtx(r *http.Request) context.Context { return applog.Observability(r.Context()) }
 
 // errRespFor writes an error that carries its own machine-readable code.
 func errRespFor(w http.ResponseWriter, err error) {

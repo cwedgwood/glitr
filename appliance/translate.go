@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"errors"
 	"log"
 	"maps"
@@ -271,15 +272,19 @@ func (c *Coordinator) desiredLIO() lio.Config {
 // reality rather than compounding a wrong assumption.
 //
 // Caller must hold c.mu.
-func (c *Coordinator) reconcile() (lio.Report, error) {
+func (c *Coordinator) reconcile(ctx context.Context) (lio.Report, error) {
 	desired := c.desiredLIO()
+	// Captured before anything can overwrite it: both edges of the reconcile
+	// verdict are reported, and the falling one needs to know what the
+	// previous state was.
+	prev := c.lastReconcileErr
 
 	if c.applied == nil {
-		return c.reconcileFull(desired)
+		return c.reconcileFull(ctx, prev, desired)
 	}
 	delta, ok := lio.Diff(*c.applied, desired)
 	if !ok {
-		return c.reconcileFull(desired)
+		return c.reconcileFull(ctx, prev, desired)
 	}
 
 	rep, err := c.lio.ApplyDelta(desired, delta)
@@ -292,12 +297,13 @@ func (c *Coordinator) reconcile() (lio.Report, error) {
 			// under a running daemon.
 			log.Printf("incremental reconcile refused (%v); falling back to a full reconcile", err)
 			c.applied = nil
-			return c.reconcileFull(desired)
+			return c.reconcileFull(ctx, prev, desired)
 		}
 		// The tree no longer matches the cached view; force a full reconcile
 		// next time rather than diffing against a belief we know is wrong.
 		c.applied = nil
 		c.setReconcileErr(err)
+		c.logReconcileOutcome(ctx, prev, err, "incremental", rep)
 		return rep, err
 	}
 	// Establish every fact BEFORE publishing any of it. Both of these walk
@@ -323,13 +329,14 @@ func (c *Coordinator) reconcile() (lio.Report, error) {
 	c.lastReconcileErr = nil
 	c.applied = appliedView(desired, drift)
 	c.publishReconcile(nil, unbound, stranded, undecided, drift)
+	c.logReconcileOutcome(ctx, prev, nil, "incremental", rep)
 	c.logSlow(rep, "incremental")
 	return rep, nil
 }
 
 // reconcileFull runs the authoritative full-tree reconcile and refreshes the
 // cached view of what is applied. Caller must hold c.mu.
-func (c *Coordinator) reconcileFull(desired lio.Config) (lio.Report, error) {
+func (c *Coordinator) reconcileFull(ctx context.Context, prev error, desired lio.Config) (lio.Report, error) {
 	rep, err := c.lio.Sync(desired)
 	c.lastReconcileErr = err
 	if err != nil {
@@ -338,6 +345,7 @@ func (c *Coordinator) reconcileFull(desired lio.Config) (lio.Report, error) {
 		// previous generation's warnings stand rather than being replaced
 		// with a partial report. Degraded is the loud direction anyway.
 		c.publishReconcileFailure(err)
+		c.logReconcileOutcome(ctx, prev, err, "full", rep)
 		c.logSlow(rep, "full")
 		return rep, err
 	}
@@ -347,6 +355,7 @@ func (c *Coordinator) reconcileFull(desired lio.Config) (lio.Report, error) {
 	// one generation under a single lock -- see publishReconcile.
 	syncStranded, syncUndecided := strandedText(c.lio.StrandedReservations(desired))
 	c.publishReconcile(nil, rep.APTPLUnbound, syncStranded, syncUndecided, rep.Drift)
+	c.logReconcileOutcome(ctx, prev, nil, "full", rep)
 	c.logSlow(rep, "full")
 	return rep, err
 }

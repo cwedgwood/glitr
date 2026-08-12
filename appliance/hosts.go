@@ -1,8 +1,8 @@
 package appliance
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"slices"
 	"strings"
@@ -22,7 +22,10 @@ import (
 // created reports whether this call is what registered it; false means the
 // name was already taken by a matching host. See [Coordinator.Create] for why
 // the distinction is reported rather than hidden.
-func (c *Coordinator) CreateHost(name string, iqns []string) (h Host, created bool, err error) {
+func (c *Coordinator) CreateHost(ctx context.Context, name string, iqns []string) (h Host, created bool, err error) {
+	ev := c.beginOp(ctx, eventHostCreate, "resource_name", name, "iqn_count", len(iqns))
+	defer func() { ev.set("created", created).finish(err) }()
+
 	if err := checkName(name); err != nil {
 		return Host{}, false, err
 	}
@@ -40,6 +43,7 @@ func (c *Coordinator) CreateHost(name string, iqns []string) (h Host, created bo
 			return Host{}, false, statusErrCode(http.StatusConflict, CodeConfigurationMismatch,
 				"host %q already exists with bindings %v, not %v", name, existing.Bindings.IQNs, iqns)
 		}
+		ev.set("resource_id", existing.UUID)
 		return copyHost(*existing), false, nil
 	}
 	if err := c.checkIQNs(iqns, ""); err != nil {
@@ -49,8 +53,9 @@ func (c *Coordinator) CreateHost(name string, iqns []string) (h Host, created bo
 	if err != nil {
 		return Host{}, false, err
 	}
+	ev.set("resource_id", uuid)
 	var newHost Host
-	if err := c.commit(func() error {
+	if err := c.commit(ctx, ev, func() error {
 		h := &Host{UUID: uuid, Name: name,
 			Bindings: Bindings{IQNs: append([]string(nil), iqns...)}}
 		c.st.Hosts = append(c.st.Hosts, h)
@@ -108,25 +113,29 @@ func (c *Coordinator) GetHost(ref string) (Host, bool) {
 }
 
 // RenameHost changes a host's name, keeping its uuid, bindings and connections.
-func (c *Coordinator) RenameHost(ref, newName string) (Host, error) {
+func (c *Coordinator) RenameHost(ctx context.Context, ref, newName string) (h Host, err error) {
+	ev := c.beginOp(ctx, eventHostRename, "new_name", newName, "ref", ref)
+	defer func() { ev.finish(err) }()
+
 	if err := checkName(newName); err != nil {
 		return Host{}, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	h := c.resolveHost(ref)
-	if h == nil {
+	target := c.resolveHost(ref)
+	if target == nil {
 		return Host{}, notFound("host", ref)
 	}
-	if h.Name == newName {
-		return copyHost(*h), nil
+	ev.set("resource_id", target.UUID, "old_name", target.Name)
+	if target.Name == newName {
+		return copyHost(*target), nil
 	}
 	if c.hostByName(newName) != nil {
 		return Host{}, nameTaken("host", newName)
 	}
-	old := h.Name
-	if err := c.persistOnly(func() error {
+	old := target.Name
+	if err := c.persistOnly(ctx, ev, func() error {
 		if t := c.hostByName(old); t != nil {
 			t.Name = newName
 		}
@@ -143,16 +152,21 @@ func (c *Coordinator) RenameHost(ref, newName string) (Host, error) {
 // shape of the request, what matters is which bindings are LOST: an initiator
 // that loses its ACL loses its access, and the kernel releases any reservation
 // whose holder loses its mapped LUN. Returns a warning when that happens.
-func (c *Coordinator) SetBindings(ref string, replace, add, remove []string) (Host, string, error) {
+func (c *Coordinator) SetBindings(ctx context.Context, ref string, replace, add, remove []string) (h Host, warning string, err error) {
+	ev := c.beginOp(ctx, eventHostBindings, "ref", ref)
+	defer func() { ev.finish(err) }()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	h := c.resolveHost(ref)
-	if h == nil {
+	host := c.resolveHost(ref)
+	if host == nil {
 		return Host{}, "", notFound("host", ref)
 	}
 
-	next := append([]string(nil), h.Bindings.IQNs...)
+	ev.set("resource_name", host.Name, "resource_id", host.UUID)
+
+	next := append([]string(nil), host.Bindings.IQNs...)
 	if replace != nil {
 		next = append([]string(nil), replace...)
 	}
@@ -170,12 +184,12 @@ func (c *Coordinator) SetBindings(ref string, replace, add, remove []string) (Ho
 		}
 		next = kept
 	}
-	if err := c.checkIQNs(next, h.UUID); err != nil {
+	if err := c.checkIQNs(next, host.UUID); err != nil {
 		return Host{}, "", err
 	}
 
 	var dropped []string
-	for _, q := range h.Bindings.IQNs {
+	for _, q := range host.Bindings.IQNs {
 		if !slices.Contains(next, q) {
 			dropped = append(dropped, q)
 		}
@@ -186,12 +200,12 @@ func (c *Coordinator) SetBindings(ref string, replace, add, remove []string) (Ho
 	var warnings []string
 	if len(dropped) > 0 {
 		for _, cn := range c.st.Connections {
-			if cn.HostUUID != h.UUID {
+			if cn.HostUUID != host.UUID {
 				continue
 			}
 			if w := c.fenceLossWarningFor(cn.ObjectUUID, dropped, "",
 				fmt.Sprintf("removing %s from host %q (object %s)",
-					strings.Join(dropped, ", "), h.Name, cn.ObjectUUID)); w != "" {
+					strings.Join(dropped, ", "), host.Name, cn.ObjectUUID)); w != "" {
 				warnings = append(warnings, w)
 			}
 		}
@@ -202,14 +216,20 @@ func (c *Coordinator) SetBindings(ref string, replace, add, remove []string) (Ho
 	// them. An early return carrying only the error would drop the one signal
 	// this produces, on the path an operator is least likely to read closely
 	// because something else already failed.
-	warning := strings.Join(warnings, " | ")
+	warning = strings.Join(warnings, " | ")
 	if warning != "" {
-		log.Printf("WARNING: %s", warning)
+		// Attributed to this operation rather than emitted as a free-floating
+		// line. It is still logged BEFORE the commit, for the reason given
+		// above -- but as its own event carrying the request id, so a reader
+		// can join it to the operation that caused it even though the
+		// operation's own event has not been emitted yet.
+		c.logFenceReleased(ctx, warning, "host", host.Name, host.UUID)
+		ev.set("warning", warning)
 	}
 
-	uuid := h.UUID
+	uuid := host.UUID
 	var updated Host
-	if err := c.commit(func() error {
+	if err := c.commit(ctx, ev, func() error {
 		t := c.host(uuid)
 		t.Bindings.IQNs = next
 		updated = *t
@@ -221,7 +241,10 @@ func (c *Coordinator) SetBindings(ref string, replace, add, remove []string) (Ho
 }
 
 // DeleteHost removes a host. Refused while it has connections.
-func (c *Coordinator) DeleteHost(ref string) error {
+func (c *Coordinator) DeleteHost(ctx context.Context, ref string) (err error) {
+	ev := c.beginOp(ctx, eventHostDelete, "ref", ref)
+	defer func() { ev.finish(err) }()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -229,12 +252,13 @@ func (c *Coordinator) DeleteHost(ref string) error {
 	if h == nil {
 		return notFound("host", ref)
 	}
+	ev.set("resource_name", h.Name, "resource_id", h.UUID)
 	if len(c.connectionsOfHost(h.UUID)) > 0 {
 		return statusErrCode(http.StatusConflict, CodeResourceConnected,
 			"host %q has connections; disconnect first", h.Name)
 	}
 	uuid := h.UUID
-	return c.commit(func() error {
+	return c.commit(ctx, ev, func() error {
 		kept := c.st.Hosts[:0]
 		for _, x := range c.st.Hosts {
 			if x.UUID != uuid {
@@ -268,7 +292,14 @@ func (c *Coordinator) connectionsOfHost(hostUUID string) []*Connection {
 // Safe to retry: connecting something already connected at that LUN returns
 // the same details rather than a conflict. created reports which of those
 // happened -- see [Coordinator.Create].
-func (c *Coordinator) Connect(kind Kind, objectRef, hostRef string, lun int, lunGiven bool) (info ConnInfo, created bool, err error) {
+func (c *Coordinator) Connect(ctx context.Context, kind Kind, objectRef, hostRef string, lun int, lunGiven bool) (info ConnInfo, created bool, err error) {
+	ev := c.beginOp(ctx, eventConnectionCreate,
+		"object_name", objectRef, "object_kind", string(kind), "host_name", hostRef)
+	if lunGiven {
+		ev.set("lun", lun)
+	}
+	defer func() { ev.set("created", created).finish(err) }()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -280,10 +311,12 @@ func (c *Coordinator) Connect(kind Kind, objectRef, hostRef string, lun int, lun
 		return ConnInfo{}, false, statusErrCode(http.StatusConflict, CodeUnsupportedState,
 			"%s %q is %s", o.Kind, o.Name, o.State)
 	}
+	ev.set("object_id", o.UUID, "wwn", o.WWN)
 	h := c.resolveHost(hostRef)
 	if h == nil {
 		return ConnInfo{}, false, notFound("host", hostRef)
 	}
+	ev.set("host_id", h.UUID)
 	if !lunGiven {
 		return ConnInfo{}, false, statusErrCode(http.StatusBadRequest, CodeLUNRequired,
 			"a lun is required: the appliance does not assign one, because in a "+
@@ -314,7 +347,7 @@ func (c *Coordinator) Connect(kind Kind, objectRef, hostRef string, lun int, lun
 	}
 
 	objUUID, hostUUID := o.UUID, h.UUID
-	if err := c.commit(func() error {
+	if err := c.commit(ctx, ev, func() error {
 		c.exportIndex(objUUID)
 		c.st.Connections = append(c.st.Connections,
 			&Connection{ObjectUUID: objUUID, HostUUID: hostUUID, LUN: lun})
@@ -330,7 +363,11 @@ func (c *Coordinator) Connect(kind Kind, objectRef, hostRef string, lun int, lun
 // Returns a warning when this releases a SCSI-3 reservation the host held. It
 // is not refused: an operator must be able to detach a host that may itself be
 // dead, which is the whole reason the warning exists rather than a refusal.
-func (c *Coordinator) Disconnect(kind Kind, objectRef, hostRef string) (warning string, err error) {
+func (c *Coordinator) Disconnect(ctx context.Context, kind Kind, objectRef, hostRef string) (warning string, err error) {
+	ev := c.beginOp(ctx, eventConnectionDelete,
+		"object_name", objectRef, "object_kind", string(kind), "host_name", hostRef)
+	defer func() { ev.finish(err) }()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -355,16 +392,17 @@ func (c *Coordinator) Disconnect(kind Kind, objectRef, hostRef string) (warning 
 		// had already worked".
 		return "", nil
 	}
-	if err := c.healIfDegraded(); err != nil {
+	if err := c.healIfDegraded(ctx); err != nil {
 		return "", err
 	}
 
 	warning = c.fenceLossWarning(o.UUID, h.UUID)
 	if warning != "" {
-		log.Printf("WARNING: %s", warning)
+		c.logFenceReleased(ctx, warning, string(o.Kind), o.Name, o.UUID)
+		ev.set("warning", warning)
 	}
 	objUUID, hostUUID := o.UUID, h.UUID
-	if err := c.commit(func() error {
+	if err := c.commit(ctx, ev, func() error {
 		kept := c.st.Connections[:0]
 		for _, cn := range c.st.Connections {
 			if cn.ObjectUUID == objUUID && cn.HostUUID == hostUUID {

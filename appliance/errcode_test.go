@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -27,7 +28,7 @@ func decodeErr(t *testing.T, rec *httptest.ResponseRecorder) map[string]string {
 func TestEveryErrorCarriesACode(t *testing.T) {
 	c, _ := stageHolder(t, "")
 	h := Handler(c)
-	if _, _, err := c.Create(KindVolume, CreateRequest{Name: "taken", Size: 1 << 20}); err != nil {
+	if _, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "taken", Size: 1 << 20}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,20 +98,20 @@ func TestConflictsAreDistinguishable(t *testing.T) {
 	c, v := stageHolder(t, "iqn.x:holder")
 
 	// Already connected at a different lun.
-	_, _, err := c.Connect(KindVolume, v.UUID, hHolder, 7, true)
+	_, _, err := c.Connect(context.Background(), KindVolume, v.UUID, hHolder, 7, true)
 	assertCode(t, err, http.StatusConflict, CodeConfigurationMismatch)
 
 	// Lun occupied by a different object.
 	other := mustObject(t, c, "conflict-probe", 1<<20)
-	_, _, err = c.Connect(KindVolume, other.UUID, hHolder, 1, true)
+	_, _, err = c.Connect(context.Background(), KindVolume, other.UUID, hHolder, 1, true)
 	assertCode(t, err, http.StatusConflict, CodeLUNConflict)
 
 	// A lun is never assigned, so omitting one is an error and says so.
-	_, _, err = c.Connect(KindVolume, other.UUID, hHolder, 0, false)
+	_, _, err = c.Connect(context.Background(), KindVolume, other.UUID, hHolder, 0, false)
 	assertCode(t, err, http.StatusBadRequest, CodeLUNRequired)
 
 	// Still connected.
-	err = c.Delete(KindVolume, v.UUID)
+	err = c.Delete(context.Background(), KindVolume, v.UUID)
 	assertCode(t, err, http.StatusConflict, CodeResourceConnected)
 }
 
