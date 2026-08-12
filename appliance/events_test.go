@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -496,4 +498,66 @@ func TestAFenceReleaseIsAttributableToItsRequest(t *testing.T) {
 	want(t, m, "request_id", "req-7")
 	want(t, m, "resource_name", "vol-1")
 	want(t, m, "level", "WARN")
+}
+
+// TestARequestJoinsToTheOperationItCaused is the end-to-end claim.
+//
+// Phase 1 could say a request arrived and what status it returned. Phase 2
+// says what the appliance did about it. Neither is worth much unless the two
+// records can be joined, which is a property of the whole path -- the access
+// middleware minting or honouring the id, the handler deriving an
+// uncancellable context from the request, and the coordinator attaching it --
+// and not of any single function. Every part of that can be individually
+// correct while the chain is broken, so it is asserted through a real HTTP
+// request against the real handler.
+func TestARequestJoinsToTheOperationItCaused(t *testing.T) {
+	c, e := eventCoordinator(t)
+
+	h := applog.AccessLog(e.log, Handler(c))
+	body := strings.NewReader(`{"name":"vol-1","size":1048576}`)
+	req := httptest.NewRequest(http.MethodPost, APIPrefix+"/volumes", body)
+	req.Header.Set(applog.HeaderRequestID, "caller-supplied-id")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create returned %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	// Honoured, not replaced: a CSI driver's own id is more useful than one
+	// the appliance invents, and it is echoed so the caller can log the join.
+	if got := rec.Header().Get(applog.HeaderRequestID); got != "caller-supplied-id" {
+		t.Errorf("the response echoed %q, want the id the caller sent", got)
+	}
+
+	access := e.one(t, "rest.access")
+	op := e.one(t, "volume.create")
+	want(t, access, "request_id", "caller-supplied-id")
+	want(t, op, "request_id", "caller-supplied-id")
+
+	// The two halves of the question, on records a consumer can join.
+	want(t, access, "status", float64(http.StatusCreated))
+	want(t, op, "outcome", outcomeSucceeded)
+	want(t, op, "durable", true)
+	want(t, op, "created", true)
+}
+
+// TestTheAccessLogKeepsCallerNamesOutOfTheRouteField.
+//
+// rest.access logs the routed PATTERN, not the concrete path, which keeps
+// caller-chosen volume names out of the log and the cardinality bounded. The
+// operation event is where the name belongs, because there it is the subject
+// rather than an incidental part of a URL.
+func TestTheAccessLogKeepsCallerNamesOutOfTheRouteField(t *testing.T) {
+	c, e := eventCoordinator(t)
+	h := applog.AccessLog(e.log, Handler(c))
+
+	body := strings.NewReader(`{"name":"secret-customer-name","size":1048576}`)
+	req := httptest.NewRequest(http.MethodPost, APIPrefix+"/volumes", body)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	access := e.one(t, "rest.access")
+	if route, _ := access["route"].(string); strings.Contains(route, "secret-customer-name") {
+		t.Errorf("the route field carried a caller-chosen name: %q", route)
+	}
+	want(t, e.one(t, "volume.create"), "resource_name", "secret-customer-name")
 }
