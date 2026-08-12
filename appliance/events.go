@@ -337,3 +337,32 @@ func (c *Coordinator) logFenceReleased(ctx context.Context, warning, kind, name,
 	applog.Warn(ctx, c.logger(), eventPRReleased, warning,
 		"resource_kind", kind, "resource_name", name, "resource_id", uuid)
 }
+
+// Standing-condition and diagnostic events.
+//
+// These were prose lines routed through the stdlib bridge. Converting them is
+// what makes the stream uniformly filterable: a consumer can select on event
+// rather than matching on message text, and each one now carries its real
+// severity instead of the bridge's blanket WARN.
+const (
+	eventConfigIgnored        = "config.flag_ignored"
+	eventIdentityAdopted      = "identity.adopted"
+	eventIdentityNoMachineID  = "identity.no_machine_id"
+	eventStorageQuarantined   = "storage.quarantined"
+	eventStorageMissing       = "storage.missing"
+	eventPROrphans            = "pr.orphans"
+	eventPROrphanCheckFailed  = "pr.orphan_check_failed"
+	eventPRStranded           = "pr.stranded"
+	eventPRStrandUndecided    = "pr.strand_undecided"
+	eventPRUnbound            = "pr.unbound"
+	eventPRDiscardFailed      = "pr.discard_failed"
+	eventAttributeDrift       = "drift.attribute"
+	eventCommitSlow           = "commit.slow"
+	eventReconcileSlow        = "reconcile.slow"
+	eventReconcileFallback    = "reconcile.fallback"
+	eventLifecycleShutdown    = "lifecycle.shutdown"
+	eventLifecycleDrainFailed = "lifecycle.drain_failed"
+	eventConfigWriteBack      = "config.write_back_enabled"
+	eventConfigPRCheckOff     = "config.pr_check_disabled"
+	eventStartupFailed        = "lifecycle.startup_failed"
+)

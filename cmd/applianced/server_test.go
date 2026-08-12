@@ -132,7 +132,7 @@ func TestRunServerWaitsForInFlightHandlers(t *testing.T) {
 	drained := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- runServer(func() error { return srv.Serve(ln) }, srv, stop, drained, 5*time.Second)
+		done <- runServer(slog.Default(), func() error { return srv.Serve(ln) }, srv, stop, drained, 5*time.Second)
 	}()
 
 	// Put a request in flight, then signal shutdown while it is still running.
@@ -172,7 +172,7 @@ func TestRunServerReturnsAListenerError(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- runServer(func() error { return want }, srv,
+		done <- runServer(slog.Default(), func() error { return want }, srv,
 			make(chan struct{}), make(chan struct{}), time.Second)
 	}()
 

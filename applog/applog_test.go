@@ -335,43 +335,51 @@ func TestServerErrorLogIsStructured(t *testing.T) {
 
 var _ = slog.LevelInfo
 
-// TestStdlibLogSurvivesARaisedFloor. ~45 log.Printf sites remain during the
-// migration, several of them WARNING:. slog DROPS a bridged record when the
-// handler rejects its level, so bridging at Info would silently lose every one
-// of them the moment an operator ran -log-level=warn -- while structured
-// warnings kept appearing, which is the worst possible shape for a gap.
-func TestStdlibLogSurvivesARaisedFloor(t *testing.T) {
+// TestStdlibLogBridgesAtInfo pins the level the stdlib bridge runs at, and
+// the consequence of that choice.
+//
+// It ran at WARN during the migration, because slog DROPS a bridged record
+// when the handler rejects its level: bridging at Info would have silently
+// lost the ~45 log.Printf sites that existed then -- several of which said
+// WARNING -- the moment an operator ran -log-level=warn, while structured
+// warnings kept appearing. That is the worst possible shape for a gap.
+//
+// Those sites now carry their own level and event name, so the blanket WARN
+// became an inaccuracy rather than a safeguard. The second half of this test
+// is the price, asserted rather than left implicit: a stdlib line IS dropped
+// at -log-level=warn now. That is only acceptable because nothing the
+// appliance reports as an anomaly still arrives this way, which
+// TestNoProseLoggingRemains checks.
+func TestStdlibLogBridgesAtInfo(t *testing.T) {
 	var b bytes.Buffer
-	l, _, err := New(Options{Format: "json", Level: "warn", Out: &b})
+	l, _, err := New(Options{Format: "json", Level: "info", Out: &b})
 	if err != nil {
 		t.Fatal(err)
 	}
 	Install(l)
 	t.Cleanup(func() { log.SetFlags(log.LstdFlags) })
 
-	log.Printf("WARNING: -write-back is set: writes are acknowledged from the page cache")
+	log.Printf("a line from a package that has not been converted")
 	if b.Len() == 0 {
-		t.Fatal("a stdlib log line vanished at -log-level=warn; during the " +
-			"migration that silently drops the sites that have not moved yet")
+		t.Fatal("a stdlib log line vanished at -log-level=info; the bridge is not installed")
 	}
-	if m := decode(t, &b); !strings.Contains(m["msg"].(string), "write-back") {
-		t.Errorf("the message did not survive: %v", m)
+	m := decode(t, &b)
+	if m["level"] != "INFO" {
+		t.Errorf("level = %v, want INFO -- the bridge no longer promotes to WARN", m["level"])
+	}
+
+	b.Reset()
+	l2, _, err := New(Options{Format: "json", Level: "warn", Out: &b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	Install(l2)
+	log.Printf("a line from a package that has not been converted")
+	if b.Len() != 0 {
+		t.Errorf("a bridged line survived -log-level=warn; the bridge level was "+
+			"expected to be Info, so this test no longer describes the code: %s", b.String())
 	}
 }
-
-// TestPayloadLevelAttrCollides documents a real trap rather than asserting a
-// protection that does not exist.
-//
-// An earlier version of this test claimed the level formatter never touches a
-// payload attr named "level", and passed -- but only because it used a STRING
-// value, which the inner type assertion rejects anyway. The len(groups) guard
-// was never what saved it. Measured: this package emits only flat attrs, so a
-// payload attr named "level" whose value is a slog.Level IS rewritten.
-//
-// Asserting the real behaviour is worth more than asserting the intended one:
-// it fails if the collision is ever silently changed, and it tells the next
-// reader the constraint is real. The constraint itself -- do not reuse an
-// envelope key -- is documented on Options.
 func TestPayloadLevelAttrCollides(t *testing.T) {
 	var b bytes.Buffer
 	l, _, err := New(Options{Format: "json", Out: &b})
