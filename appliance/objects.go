@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -100,7 +101,16 @@ type CreateRequest struct {
 // because an object can be resized after it is made. Compare there if that
 // matters to you -- see [Coordinator.matchExisting] for why the appliance will
 // not compare it for you.
-func (c *Coordinator) Create(kind Kind, req CreateRequest) (o Object, created bool, err error) {
+func (c *Coordinator) Create(ctx context.Context, kind Kind, req CreateRequest) (o Object, created bool, err error) {
+	ev := c.beginOp(ctx, objectEvent(kind, "create"), "resource_name", req.Name)
+	if req.Source != "" {
+		// Named explicitly rather than reusing "resource_name": an event with
+		// two objects in it must say which is which, or a consumer has to
+		// know the verb to read the record.
+		ev.set("source_name", req.Source, "source_kind", string(req.SourceKind))
+	}
+	defer func() { ev.set("created", created).finish(err) }()
+
 	if err := checkName(req.Name); err != nil {
 		return Object{}, false, err
 	}
@@ -119,6 +129,13 @@ func (c *Coordinator) Create(kind Kind, req CreateRequest) (o Object, created bo
 	// callers racing one name cannot both get past the check.
 	if existing := c.objectByName(kind, req.Name); existing != nil {
 		o, err := c.matchExisting(existing, req)
+		if err == nil {
+			// An adoption, not a creation. The event says so through
+			// created=false, which is the same distinction the 200-vs-201
+			// status carries and the one a replaying controller needs.
+			ev.set("resource_id", o.UUID, "wwn", o.WWN, "size_bytes", o.Capacity,
+				"block_size", o.BlockSize)
+		}
 		return o, false, err
 	}
 
@@ -178,13 +195,16 @@ func (c *Coordinator) Create(kind Kind, req CreateRequest) (o Object, created bo
 	}
 	if source != nil {
 		obj.Source = source.UUID
+		ev.set("source_id", source.UUID)
 	}
+	ev.set("resource_id", obj.UUID, "wwn", obj.WWN, "size_bytes", obj.Capacity,
+		"block_size", obj.BlockSize)
 	// No reconcile: a new object is unexported, and desiredLIO only emits a
 	// backstore for objects with a connection. Routing this through commit()
 	// would make creating an object acquire reconcile latency and share a
 	// failure domain with every export on the appliance, for a mutation that
 	// touches no kernel state.
-	if err := c.persistOnly(func() error {
+	if err := c.persistOnly(ctx, ev, func() error {
 		c.st.Objects = append(c.st.Objects, obj)
 		return nil
 	}); err != nil {
@@ -298,7 +318,10 @@ func (c *Coordinator) Get(kind Kind, ref string) (Object, bool) {
 // Safe while the object is exported and mounted: an initiator identifies the
 // device by its WWN, which is derived from the UUID and does not move. Nothing
 // keys off the name, which is what separates a name from an identifier.
-func (c *Coordinator) Rename(kind Kind, ref, newName string) (Object, error) {
+func (c *Coordinator) Rename(ctx context.Context, kind Kind, ref, newName string) (obj Object, err error) {
+	ev := c.beginOp(ctx, objectEvent(kind, "rename"), "new_name", newName, "ref", ref)
+	defer func() { ev.finish(err) }()
+
 	if err := checkName(newName); err != nil {
 		return Object{}, err
 	}
@@ -309,6 +332,7 @@ func (c *Coordinator) Rename(kind Kind, ref, newName string) (Object, error) {
 	if o == nil {
 		return Object{}, notFound(string(kind), ref)
 	}
+	ev.set("resource_id", o.UUID, "old_name", o.Name)
 	if o.Name == newName {
 		return *o, nil
 	}
@@ -316,7 +340,7 @@ func (c *Coordinator) Rename(kind Kind, ref, newName string) (Object, error) {
 		return Object{}, nameTaken(string(kind), newName)
 	}
 	old := o.Name
-	if err := c.persistOnly(func() error {
+	if err := c.persistOnly(ctx, ev, func() error {
 		// Re-resolve: persistOnly snapshots and restores state on failure, so
 		// the pointer above may not be the record that ends up committed.
 		if t := c.objectByName(kind, old); t != nil {
@@ -330,7 +354,10 @@ func (c *Coordinator) Rename(kind Kind, ref, newName string) (Object, error) {
 }
 
 // Delete removes an object and its bytes. Refused while it is connected.
-func (c *Coordinator) Delete(kind Kind, ref string) error {
+func (c *Coordinator) Delete(ctx context.Context, kind Kind, ref string) (err error) {
+	ev := c.beginOp(ctx, objectEvent(kind, "delete"), "ref", ref)
+	defer func() { ev.finish(err) }()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -338,6 +365,7 @@ func (c *Coordinator) Delete(kind Kind, ref string) error {
 	if o == nil {
 		return notFound(string(kind), ref)
 	}
+	ev.set("resource_name", o.Name, "resource_id", o.UUID, "wwn", o.WWN)
 	if len(c.connectionsOf(o.UUID)) > 0 {
 		return statusErrCode(http.StatusConflict, CodeResourceConnected,
 			"%s %q is connected; disconnect it first", o.Kind, o.Name)
@@ -345,7 +373,7 @@ func (c *Coordinator) Delete(kind Kind, ref string) error {
 	// The db says this is unconnected -- but if a previous reconcile failed,
 	// the kernel may still hold a live LUN with an open fd on the backing
 	// file. Converge first; never unlink storage the kernel is serving.
-	if err := c.healIfDegraded(); err != nil {
+	if err := c.healIfDegraded(ctx); err != nil {
 		return err
 	}
 	uuid, wwn := o.UUID, o.WWN
@@ -354,7 +382,7 @@ func (c *Coordinator) Delete(kind Kind, ref string) error {
 	// record, which startup quarantines with the data intact. The other order
 	// would leave a record pointing at nothing, which every later operation
 	// would trip over and which no operator could clean up safely.
-	if err := c.persistOnly(func() error {
+	if err := c.persistOnly(ctx, ev, func() error {
 		c.st.Objects = deleteObject(c.st.Objects, uuid)
 		delete(c.st.Exports, uuid)
 		return nil
@@ -381,7 +409,10 @@ func deleteObject(objs []*Object, uuid string) []*Object {
 }
 
 // Resize grows an object. Reports whether initiators must rescan to see it.
-func (c *Coordinator) Resize(kind Kind, ref string, newSize int64) (rescanRequired bool, err error) {
+func (c *Coordinator) Resize(ctx context.Context, kind Kind, ref string, newSize int64) (rescanRequired bool, err error) {
+	ev := c.beginOp(ctx, objectEvent(kind, "resize"), "ref", ref, "size_bytes", newSize)
+	defer func() { ev.set("rescan_required", rescanRequired).finish(err) }()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -389,6 +420,8 @@ func (c *Coordinator) Resize(kind Kind, ref string, newSize int64) (rescanRequir
 	if o == nil {
 		return false, notFound(string(kind), ref)
 	}
+	ev.set("resource_name", o.Name, "resource_id", o.UUID, "wwn", o.WWN,
+		"previous_size_bytes", o.Capacity)
 	if newSize == o.Capacity {
 		return len(c.connectionsOf(o.UUID)) > 0, nil
 	}
@@ -401,7 +434,7 @@ func (c *Coordinator) Resize(kind Kind, ref string, newSize int64) (rescanRequir
 	if err := c.checkSize(newSize); err != nil {
 		return false, err
 	}
-	if err := c.healIfDegraded(); err != nil {
+	if err := c.healIfDegraded(ctx); err != nil {
 		return false, err
 	}
 	if err := c.store.Resize(o.UUID, newSize); err != nil {
@@ -409,7 +442,7 @@ func (c *Coordinator) Resize(kind Kind, ref string, newSize int64) (rescanRequir
 	}
 	uuid := o.UUID
 	exported := len(c.connectionsOf(uuid)) > 0
-	if err := c.persistOnly(func() error {
+	if err := c.persistOnly(ctx, ev, func() error {
 		if t := c.object(uuid); t != nil {
 			t.Capacity = newSize
 		}
@@ -419,8 +452,10 @@ func (c *Coordinator) Resize(kind Kind, ref string, newSize int64) (rescanRequir
 	}
 	// The backing file is bigger; the kernel has to be told, which is a
 	// reconcile and not a persist.
-	if _, err := c.reconcile(); err != nil {
+	if _, err := c.reconcile(ctx); err != nil {
+		ev.noteReconcile(reconcileFailed)
 		return exported, err
 	}
+	ev.noteReconcile(reconcileSucceeded)
 	return exported, nil
 }

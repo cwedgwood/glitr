@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"path/filepath"
@@ -51,11 +52,11 @@ func TestNameRules(t *testing.T) {
 func TestVolumesAndSnapshotsHaveSeparateNamespaces(t *testing.T) {
 	c, _ := stageHolder(t, "")
 
-	vol, _, err := c.Create(KindVolume, CreateRequest{Name: "db-1", Size: 1 << 20})
+	vol, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "db-1", Size: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
-	snap, _, err := c.Create(KindSnapshot, CreateRequest{
+	snap, _, err := c.Create(context.Background(), KindSnapshot, CreateRequest{
 		Name: "db-1", Source: "db-1", SourceKind: KindVolume})
 	if err != nil {
 		t.Skipf("snapshot needs a reflink filesystem: %v", err)
@@ -96,11 +97,11 @@ func containsUUID(objs []Object, uuid string) bool {
 func TestCreateWithAnExistingNameIsIdempotent(t *testing.T) {
 	c, _ := stageHolder(t, "")
 
-	first, _, err := c.Create(KindVolume, CreateRequest{Name: "db-1", Size: 1 << 20})
+	first, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "db-1", Size: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, _, err := c.Create(KindVolume, CreateRequest{Name: "db-1", Size: 1 << 20})
+	second, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "db-1", Size: 1 << 20})
 	if err != nil {
 		t.Fatalf("repeating a create with the same name must succeed: %v", err)
 	}
@@ -110,7 +111,7 @@ func TestCreateWithAnExistingNameIsIdempotent(t *testing.T) {
 	// Capacity is deliberately not compared: an object can be resized after it
 	// is made, so a size difference is not evidence of a different object and
 	// refusing would wedge a caller that grew one and then replayed its create.
-	grown, _, err := c.Create(KindVolume, CreateRequest{Name: "db-1", Size: 8 << 20})
+	grown, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "db-1", Size: 8 << 20})
 	if err != nil {
 		t.Errorf("a repeat at a different size must return the existing object: %v", err)
 	}
@@ -119,7 +120,7 @@ func TestCreateWithAnExistingNameIsIdempotent(t *testing.T) {
 	}
 	// Block size IS compared: it is fixed for the life of the object, so a
 	// different one describes something else.
-	if _, _, err := c.Create(KindVolume, CreateRequest{
+	if _, _, err := c.Create(context.Background(), KindVolume, CreateRequest{
 		Name: "db-1", Size: 1 << 20, BlockSize: MaxBlockSize}); err == nil {
 		t.Error("a repeat with a different block_size must be refused")
 	}
@@ -128,11 +129,11 @@ func TestCreateWithAnExistingNameIsIdempotent(t *testing.T) {
 func TestRenameKeepsIdentity(t *testing.T) {
 	c, _ := stageHolder(t, "")
 
-	o, _, err := c.Create(KindVolume, CreateRequest{Name: "before", Size: 1 << 20})
+	o, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "before", Size: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
-	renamed, err := c.Rename(KindVolume, "before", "after")
+	renamed, err := c.Rename(context.Background(), KindVolume, "before", "after")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,10 +156,10 @@ func TestRenameKeepsIdentity(t *testing.T) {
 	}
 	// Renaming onto a name that is taken is refused rather than silently
 	// merging two objects.
-	if _, _, err := c.Create(KindVolume, CreateRequest{Name: "taken", Size: 1 << 20}); err != nil {
+	if _, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "taken", Size: 1 << 20}); err != nil {
 		t.Fatal(err)
 	}
-	_, err = c.Rename(KindVolume, "after", "taken")
+	_, err = c.Rename(context.Background(), KindVolume, "after", "taken")
 	var se *StatusError
 	if !errors.As(err, &se) || se.ErrorCode() != CodeNameTaken {
 		t.Errorf("want %s, got %v", CodeNameTaken, err)
@@ -168,11 +169,11 @@ func TestRenameKeepsIdentity(t *testing.T) {
 func TestDeleteFreesTheName(t *testing.T) {
 	c, _ := stageHolder(t, "")
 
-	first, _, err := c.Create(KindVolume, CreateRequest{Name: "recycled", Size: 1 << 20})
+	first, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "recycled", Size: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Delete(KindVolume, "recycled"); err != nil {
+	if err := c.Delete(context.Background(), KindVolume, "recycled"); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := c.Get(KindVolume, "recycled"); ok {
@@ -180,7 +181,7 @@ func TestDeleteFreesTheName(t *testing.T) {
 	}
 	// Reusable, which is the point: a caller that deletes and recreates under
 	// the same name must not be locked out.
-	again, _, err := c.Create(KindVolume, CreateRequest{Name: "recycled", Size: 1 << 20})
+	again, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "recycled", Size: 1 << 20})
 	if err != nil {
 		t.Fatalf("the name must be reusable: %v", err)
 	}
@@ -237,7 +238,7 @@ func TestBindingsAddAndRemove(t *testing.T) {
 		// Restating the whole set is how a caller accidentally drops a
 		// binding, and dropping one is a fencing event.
 		c := seed(t, "iqn.x:one")
-		_, _, _ = c.SetBindings("node-7", nil, []string{"iqn.x:two"}, nil)
+		_, _, _ = c.SetBindings(context.Background(), "node-7", nil, []string{"iqn.x:two"}, nil)
 		if got := bindings(c); len(got) != 2 {
 			t.Errorf("bindings = %v, want both", got)
 		}
@@ -245,7 +246,7 @@ func TestBindingsAddAndRemove(t *testing.T) {
 
 	t.Run("adding an existing binding is not a duplicate", func(t *testing.T) {
 		c := seed(t, "iqn.x:one", "iqn.x:two")
-		_, _, _ = c.SetBindings("node-7", nil, []string{"iqn.x:two"}, nil)
+		_, _, _ = c.SetBindings(context.Background(), "node-7", nil, []string{"iqn.x:two"}, nil)
 		if got := bindings(c); len(got) != 2 {
 			t.Errorf("bindings = %v, want the set unchanged", got)
 		}
@@ -253,7 +254,7 @@ func TestBindingsAddAndRemove(t *testing.T) {
 
 	t.Run("remove", func(t *testing.T) {
 		c := seed(t, "iqn.x:one", "iqn.x:two")
-		_, _, _ = c.SetBindings("node-7", nil, nil, []string{"iqn.x:one"})
+		_, _, _ = c.SetBindings(context.Background(), "node-7", nil, nil, []string{"iqn.x:one"})
 		if got := bindings(c); len(got) != 1 || got[0] != "iqn.x:two" {
 			t.Errorf("bindings = %v, want just iqn.x:two", got)
 		}
@@ -264,7 +265,7 @@ func TestBindingsAddAndRemove(t *testing.T) {
 		c.st.Hosts = append(c.st.Hosts, &Host{
 			UUID: "3f2504e0-4f89-11d3-9a0c-0305e82c3402", Name: "node-8",
 			Bindings: Bindings{IQNs: []string{"iqn.x:three"}}})
-		_, _, err := c.SetBindings("node-7", []string{"iqn.x:two", "iqn.x:three"}, nil, nil)
+		_, _, err := c.SetBindings(context.Background(), "node-7", []string{"iqn.x:two", "iqn.x:three"}, nil, nil)
 		var se *StatusError
 		if !errors.As(err, &se) || se.Code != http.StatusConflict {
 			t.Errorf("want a conflict, got %v", err)
@@ -277,7 +278,7 @@ func TestBindingsAddAndRemove(t *testing.T) {
 
 	t.Run("keeping its own binding is not a conflict with itself", func(t *testing.T) {
 		c := seed(t, "iqn.x:two")
-		_, _, err := c.SetBindings("node-7", []string{"iqn.x:two"}, nil, nil)
+		_, _, err := c.SetBindings(context.Background(), "node-7", []string{"iqn.x:two"}, nil, nil)
 		var se *StatusError
 		if errors.As(err, &se) && se.Code == http.StatusConflict {
 			t.Errorf("a host keeping its own binding must not conflict: %v", err)
@@ -291,7 +292,7 @@ func TestBindingsAddAndRemove(t *testing.T) {
 func TestConnectRequiresALUN(t *testing.T) {
 	c, v := stageHolder(t, "")
 
-	_, _, err := c.Connect(KindVolume, v.UUID, hOther, 0, false)
+	_, _, err := c.Connect(context.Background(), KindVolume, v.UUID, hOther, 0, false)
 	var se *StatusError
 	if !errors.As(err, &se) || se.ErrorCode() != CodeLUNRequired {
 		t.Errorf("want %s, got %v", CodeLUNRequired, err)
@@ -300,7 +301,7 @@ func TestConnectRequiresALUN(t *testing.T) {
 	// here: connecting commits, and a commit reconciles against configfs,
 	// which needs a real kernel -- the live suites cover the rest.
 	spare := mustObject(t, c, "lun-probe", 1<<20)
-	_, _, err = c.Connect(KindVolume, spare.Name, "other", 9, true)
+	_, _, err = c.Connect(context.Background(), KindVolume, spare.Name, "other", 9, true)
 	if errors.As(err, &se) && se.ErrorCode() == CodeLUNRequired {
 		t.Errorf("an explicit lun must satisfy the check: %v", err)
 	}
@@ -310,14 +311,14 @@ func TestConnectIsIdempotentAndNamesTheConflict(t *testing.T) {
 	c, v := stageHolder(t, "")
 
 	// The fixture already connects this object to the holder at lun 1.
-	info, _, err := c.Connect(KindVolume, v.Name, "holder", 1, true)
+	info, _, err := c.Connect(context.Background(), KindVolume, v.Name, "holder", 1, true)
 	if err != nil {
 		t.Fatalf("repeating a connection must succeed: %v", err)
 	}
 	if info.LUN != 1 || info.Wwid == "" {
 		t.Errorf("a retry must return usable details, got %+v", info)
 	}
-	_, _, err = c.Connect(KindVolume, v.Name, "holder", 4, true)
+	_, _, err = c.Connect(context.Background(), KindVolume, v.Name, "holder", 4, true)
 	var se *StatusError
 	if !errors.As(err, &se) || se.ErrorCode() != CodeConfigurationMismatch {
 		t.Fatalf("want %s, got %v", CodeConfigurationMismatch, err)
@@ -393,12 +394,12 @@ func bareCoordinator(t *testing.T) *Coordinator {
 func TestCreateReportsWhetherItCreated(t *testing.T) {
 	c := bareCoordinator(t)
 
-	if _, created, err := c.Create(KindVolume, CreateRequest{Name: "fresh", Size: 1 << 20}); err != nil {
+	if _, created, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "fresh", Size: 1 << 20}); err != nil {
 		t.Fatal(err)
 	} else if !created {
 		t.Error("the first create must report created")
 	}
-	if _, created, err := c.Create(KindVolume, CreateRequest{Name: "fresh", Size: 1 << 20}); err != nil {
+	if _, created, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "fresh", Size: 1 << 20}); err != nil {
 		t.Fatal(err)
 	} else if created {
 		t.Error("a repeat must NOT report created; it adopted an existing object")
@@ -413,7 +414,7 @@ func TestCreateReportsWhetherItCreated(t *testing.T) {
 func TestRepeatConnectDoesNotReportCreated(t *testing.T) {
 	c, v := stageHolder(t, "")
 
-	if _, created, err := c.Connect(KindVolume, v.Name, "holder", 1, true); err != nil {
+	if _, created, err := c.Connect(context.Background(), KindVolume, v.Name, "holder", 1, true); err != nil {
 		t.Fatal(err)
 	} else if created {
 		t.Error("a repeat Connect must not report created; it found the existing export")
@@ -482,7 +483,7 @@ func TestConnectionFilterRefusesAnAmbiguousName(t *testing.T) {
 func TestRepeatCreateSurvivesADeletedSource(t *testing.T) {
 	c := bareCoordinator(t)
 
-	vol, _, err := c.Create(KindVolume, CreateRequest{Name: "src", Size: MinVolumeSize})
+	vol, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "src", Size: MinVolumeSize})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,12 +498,12 @@ func TestRepeatCreateSurvivesADeletedSource(t *testing.T) {
 		Created: time.Now().UTC(), State: stateReady,
 	}
 	c.st.Objects = append(c.st.Objects, snap)
-	if err := c.Delete(KindVolume, vol.Name); err != nil {
+	if err := c.Delete(context.Background(), KindVolume, vol.Name); err != nil {
 		t.Fatal(err)
 	}
 
 	// By uuid -- what the record stores, and what a controller has kept.
-	got, created, err := c.Create(KindSnapshot, CreateRequest{
+	got, created, err := c.Create(context.Background(), KindSnapshot, CreateRequest{
 		Name: "snap-1", Source: vol.UUID, SourceKind: KindVolume})
 	if err != nil {
 		t.Fatalf("replaying a create whose source has been deleted must return the "+
@@ -517,7 +518,7 @@ func TestRepeatCreateSurvivesADeletedSource(t *testing.T) {
 
 	// By NAME it cannot be matched, and must not be guessed at: names are
 	// reusable, so the name may name something else now or later.
-	_, _, err = c.Create(KindSnapshot, CreateRequest{
+	_, _, err = c.Create(context.Background(), KindSnapshot, CreateRequest{
 		Name: "snap-1", Source: "src", SourceKind: KindVolume})
 	if err == nil {
 		t.Fatal("a name that resolves to nothing must not be assumed to be the source")
@@ -530,14 +531,14 @@ func TestRepeatCreateSurvivesADeletedSource(t *testing.T) {
 
 	// A REUSED name resolves to a different object, and refusing that is
 	// right: what wears the name today is not what this was made from.
-	other, _, err := c.Create(KindVolume, CreateRequest{Name: "src", Size: MinVolumeSize})
+	other, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "src", Size: MinVolumeSize})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if other.UUID == vol.UUID {
 		t.Fatal("the recreated volume reused the old identity")
 	}
-	_, _, err = c.Create(KindSnapshot, CreateRequest{
+	_, _, err = c.Create(context.Background(), KindSnapshot, CreateRequest{
 		Name: "snap-1", Source: "src", SourceKind: KindVolume})
 	if err == nil {
 		t.Error("a name that now resolves to a DIFFERENT object must be refused")

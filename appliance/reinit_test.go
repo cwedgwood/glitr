@@ -2,6 +2,7 @@ package appliance
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -27,7 +28,7 @@ func stageClone(t *testing.T, machineID string) (root string, wwns []string) {
 		dbPath: filepath.Join(root, "appliance.json"),
 	}
 	for _, name := range []string{"db-1", "db-2"} {
-		o, _, err := c.Create(KindVolume, CreateRequest{Name: name, Size: MinVolumeSize})
+		o, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: name, Size: MinVolumeSize})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -35,7 +36,7 @@ func stageClone(t *testing.T, machineID string) (root string, wwns []string) {
 	}
 	c.st.TargetIQN, c.st.MachineID = IQNPrefix+machineID, machineID
 	c.st.Portals = []lio.Portal{p("10.0.0.1", 3260)}
-	if err := c.persist(); err != nil {
+	if err := c.persist(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
 	return root, wwns

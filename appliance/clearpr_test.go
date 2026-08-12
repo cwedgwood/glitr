@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -20,7 +21,7 @@ import (
 func TestClearReservationRequiresConfirmationByName(t *testing.T) {
 	for _, confirm := range []string{"", "other", "UNDER-TEST"} {
 		c, v := stageHolder(t, "iqn.x:holder")
-		out, err := c.ClearReservation(KindVolume, v.Name, confirm)
+		out, err := c.ClearReservation(context.Background(), KindVolume, v.Name, confirm)
 		if err == nil {
 			t.Fatalf("confirm=%q must be refused: an unconfirmed clear silently "+
 				"drops fencing for every initiator on the volume", confirm)
@@ -57,7 +58,7 @@ func TestClearReservationRequiresConfirmationByName(t *testing.T) {
 // the confirm check, so a typo'd name cannot be "confirmed" into existence.
 func TestClearReservationRefusesUnknownObject(t *testing.T) {
 	c, _ := stageHolder(t, "iqn.x:holder")
-	_, err := c.ClearReservation(KindVolume, "no-such-volume", "no-such-volume")
+	_, err := c.ClearReservation(context.Background(), KindVolume, "no-such-volume", "no-such-volume")
 	if err == nil {
 		t.Fatal("clearing a reservation on a volume that does not exist must fail")
 	}
@@ -219,7 +220,7 @@ func TestClearReservationAlwaysReleasesTheWithheldObject(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = os.Chmod(filepath.Join(root, "core"), 0o755) })
 
-		_, err := c.ClearReservation(KindVolume, v.Name, v.Name)
+		_, err := c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 		if err == nil {
 			t.Fatal("a clear that cannot prune must not report success")
 		}
@@ -237,7 +238,7 @@ func TestClearReservationAlwaysReleasesTheWithheldObject(t *testing.T) {
 		c, v, _ := stageHolderAt(t, "iqn.x:holder")
 		c.cfg.DBRoot = t.TempDir()
 
-		_, _ = c.ClearReservation(KindVolume, v.Name, v.Name)
+		_, _ = c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 		if c.prClearing != "" {
 			t.Fatalf("the object is still withheld (%q) after the clear returned",
 				c.prClearing)
@@ -428,7 +429,7 @@ func TestClearReservationRunsThePhasesInOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := c.ClearReservation(KindVolume, v.Name, v.Name)
+	out, err := c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 
 	// The record must be gone whatever the call returned. If it survives, the
 	// rebuild replays it and the clear silently restores the fence it was
@@ -471,7 +472,7 @@ func TestClearInProgressIsVisibleAndTransient(t *testing.T) {
 	c.mu.Unlock()
 
 	// And it must not survive the operation, whatever the outcome.
-	_, _ = c.ClearReservation(KindVolume, v.Name, v.Name)
+	_, _ = c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 	if got := c.HealthSnapshot().ClearInProgress; got != "" {
 		t.Errorf("the clear finished but /health still reports it in progress: %q", got)
 	}
@@ -688,7 +689,7 @@ func TestClearPublishesInProgressWhileRunning(t *testing.T) {
 			}
 		}
 	}()
-	_, _ = c.ClearReservation(KindVolume, v.Name, v.Name)
+	_, _ = c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 	close(stop)
 
 	select {
@@ -746,7 +747,7 @@ func TestFailedPruneReportsADroppedFence(t *testing.T) {
 		"SPC-3 PR Registrations:\niSCSI Node: iqn.x:other Key: 0x00000000b5b5b5b5\n")
 	c.applied = appliedView(c.desiredLIO(), nil)
 
-	out, err := c.recoverFromFailedPrune(ClearedReservation{Object: v.Name},
+	out, err := c.recoverFromFailedPrune(context.Background(), ClearedReservation{Object: v.Name},
 		KindVolume, v.Name, v.UUID, errors.New("injected prune failure"))
 	if err == nil {
 		t.Fatal("a failed prune must still be an error")
@@ -775,7 +776,7 @@ func TestFailedPruneWithASurvivingHolderReadsAsStillFenced(t *testing.T) {
 	stagePR(t, c, root, v, "iqn.x:holder", "SPC-3 PR Registrations:\nNone\n")
 	c.applied = appliedView(c.desiredLIO(), nil)
 
-	_, err := c.recoverFromFailedPrune(ClearedReservation{Object: v.Name},
+	_, err := c.recoverFromFailedPrune(context.Background(), ClearedReservation{Object: v.Name},
 		KindVolume, v.Name, v.UUID, errors.New("injected prune failure"))
 	if err == nil {
 		t.Fatal("a failed prune must be an error")
@@ -833,7 +834,7 @@ func TestPhase2FailurePublishesWithheldAndNamesTheFile(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(prDir, 0o755) })
 
-	out, err := c.ClearReservation(KindVolume, v.Name, v.Name)
+	out, err := c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 	if err == nil {
 		t.Fatal("a clear that cannot discard the saved record must fail: rebuilding " +
 			"replays it and silently restores the fence")
@@ -887,7 +888,7 @@ func TestClearRefusesWhileDegraded(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(root, 0o755) })
 
-	_, err := c.ClearReservation(KindVolume, v.Name, v.Name)
+	_, err := c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 	if err == nil {
 		t.Fatal("a clear must not run against a kernel tree known to disagree " +
 			"with the database")
@@ -951,7 +952,7 @@ func TestAClearOfOneObjectDoesNotReleaseAnother(t *testing.T) {
 		}
 	}
 	c.applied = appliedView(c.desiredLIO(), nil)
-	_, _ = c.ClearReservation(KindVolume, v.Name, v.Name)
+	_, _ = c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 
 	if slices.Contains(backstoreNamesOf(c), backstoreName(other.UUID)) {
 		t.Error("clearing one object re-exported a DIFFERENT object that a failed " +
@@ -989,7 +990,7 @@ func TestDeletingAWithheldObjectReleasesTheHold(t *testing.T) {
 	c.st.Connections = slices.DeleteFunc(c.st.Connections, func(cn *Connection) bool {
 		return cn.ObjectUUID == other.UUID
 	})
-	if err := c.Delete(KindVolume, other.Name); err != nil {
+	if err := c.Delete(context.Background(), KindVolume, other.Name); err != nil {
 		t.Fatal(err)
 	}
 	if got := c.HealthSnapshot().Withheld; slices.Contains(got, other.Name) {
@@ -1018,7 +1019,7 @@ func TestPreClearReadFailureIsNotReportedAsKnown(t *testing.T) {
 	}
 
 	c.cfg.DBRoot = t.TempDir()
-	out, _ := c.ClearReservation(KindVolume, v.Name, v.Name)
+	out, _ := c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 	if out.HeldKnown {
 		t.Error("the pre-clear state was unreadable, so held_known must be false; " +
 			"true tells a machine 'nothing was held' when something may have been")
@@ -1050,7 +1051,7 @@ func TestSPC2ReservationIsReportedAsHeld(t *testing.T) {
 	}
 
 	c.cfg.DBRoot = t.TempDir()
-	out, _ := c.ClearReservation(KindVolume, v.Name, v.Name)
+	out, _ := c.ClearReservation(context.Background(), KindVolume, v.Name, v.Name)
 	if !out.Held || !out.HeldKnown {
 		t.Errorf("an SPC-2 reservation is cleared by the tear-down and must be "+
 			"reported as held; got held=%v held_known=%v", out.Held, out.HeldKnown)
@@ -1083,7 +1084,7 @@ func TestFailedPruneWithUnreadableStateIsFenceUnknown(t *testing.T) {
 	}
 	c.applied = appliedView(c.desiredLIO(), nil)
 
-	_, err := c.recoverFromFailedPrune(ClearedReservation{Object: v.Name},
+	_, err := c.recoverFromFailedPrune(context.Background(), ClearedReservation{Object: v.Name},
 		KindVolume, v.Name, v.UUID, errors.New("injected prune failure"))
 	if err == nil {
 		t.Fatal("a failed prune must be an error")

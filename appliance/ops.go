@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -299,7 +300,10 @@ func (c *Coordinator) Target() (string, []lio.Portal) {
 // while any other address holds its port, so the wildcard cases are strictly
 // prune-then-add. lio.Sync already encodes that, and re-implementing any of it
 // here would give two orderings that can disagree.
-func (c *Coordinator) SetPortals(portals []lio.Portal) ([]lio.Portal, error) {
+func (c *Coordinator) SetPortals(ctx context.Context, portals []lio.Portal) (out []lio.Portal, err error) {
+	ev := c.beginOp(ctx, eventTargetPortals, "portals", portalsText(portals))
+	defer func() { ev.finish(err) }()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -322,6 +326,7 @@ func (c *Coordinator) SetPortals(portals []lio.Portal) ([]lio.Portal, error) {
 	}
 
 	prev := slices.Clone(c.st.Portals)
+	ev.set("previous_portals", portalsText(prev))
 	if samePortalSet(prev, portals) {
 		// Nothing to do. Returning early keeps a no-op request from bouncing
 		// the fabric: the reconciler would prune and re-add nothing, but a
@@ -329,7 +334,7 @@ func (c *Coordinator) SetPortals(portals []lio.Portal) ([]lio.Portal, error) {
 		return c.portals(), nil
 	}
 
-	if err := c.commit(func() error {
+	if err := c.commit(ctx, ev, func() error {
 		c.st.Portals = slices.Clone(portals)
 		return nil
 	}); err != nil {
@@ -356,7 +361,8 @@ func (c *Coordinator) SetPortals(portals []lio.Portal) ([]lio.Portal, error) {
 	c.healthMu.Lock()
 	c.portalFlagIgnored = ""
 	c.healthMu.Unlock()
-	log.Printf("appliance: portals set to %s (were %s)",
-		portalsText(portals), portalsText(prev))
+	// The prose line is gone: the operation event carries portals and
+	// previous_portals as fields, which is the same information in a form a
+	// consumer can filter on.
 	return c.portals(), nil
 }

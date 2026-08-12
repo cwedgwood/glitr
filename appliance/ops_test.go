@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -182,7 +183,7 @@ func TestSizeRules(t *testing.T) {
 	c, _ := stageHolder(t, "")
 
 	for _, size := range []int64{1, 512, 4096, MinVolumeSize - 4096} {
-		if _, _, err := c.Create(KindVolume, CreateRequest{Name: "too-small", Size: size}); err == nil {
+		if _, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "too-small", Size: size}); err == nil {
 			t.Errorf("size %d is below the %d-byte minimum and must be refused",
 				size, MinVolumeSize)
 		}
@@ -200,7 +201,7 @@ func TestSizeRules(t *testing.T) {
 			continue // not an unaligned case on a store with this granularity
 		}
 		for _, bs := range []int{DefaultBlockSize, MaxBlockSize} {
-			_, _, err := c.Create(KindVolume, CreateRequest{Name: "unaligned", Size: size, BlockSize: bs})
+			_, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: "unaligned", Size: size, BlockSize: bs})
 			if err == nil {
 				t.Errorf("size %d is not a multiple of %d and must be refused at block_size %d",
 					size, gran, bs)
@@ -215,7 +216,7 @@ func TestSizeRules(t *testing.T) {
 	}
 	for i, bs := range []int{0, DefaultBlockSize, MaxBlockSize} {
 		name := fmt.Sprintf("floor-%d", i)
-		if _, _, err := c.Create(KindVolume, CreateRequest{Name: name, Size: MinVolumeSize, BlockSize: bs}); err != nil {
+		if _, _, err := c.Create(context.Background(), KindVolume, CreateRequest{Name: name, Size: MinVolumeSize, BlockSize: bs}); err != nil {
 			t.Errorf("the minimum size must be creatable at block_size %d: %v", bs, err)
 		}
 	}

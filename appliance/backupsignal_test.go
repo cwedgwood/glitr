@@ -1,6 +1,7 @@
 package appliance
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -41,7 +42,7 @@ func TestBackupSignalClearsWhenBackupsRecover(t *testing.T) {
 	}
 
 	// A persist whose backup succeeds must clear it.
-	if err := c.persist(); err != nil {
+	if err := c.persist(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := c.HealthSnapshot().BackupErr; got != "" {
@@ -73,7 +74,7 @@ func TestBackupSignalRecordsARealLinkFailure(t *testing.T) {
 	c.dbPath = filepath.Join(dir, strings.Repeat("d", 225))
 
 	// First persist: nothing to link yet, so this must be clean.
-	if err := c.persist(); err != nil {
+	if err := c.persist(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := c.HealthSnapshot().BackupErr; got != "" {
@@ -83,7 +84,7 @@ func TestBackupSignalRecordsARealLinkFailure(t *testing.T) {
 
 	// Second persist: the database now exists, so linkBackup runs -- and the
 	// link target is one byte over NAME_MAX.
-	if err := c.persist(); err != nil {
+	if err := c.persist(context.Background(), nil); err != nil {
 		t.Fatalf("a failing BACKUP must not fail the persist: the backup is a "+
 			"recovery convenience, and refusing the write would turn tidy-up "+
 			"into an outage: %v", err)
@@ -106,10 +107,10 @@ func TestBackupSignalRecordsARealLinkFailure(t *testing.T) {
 	// Now recover: a normal-length path makes the link fit, and the next
 	// successful persist must clear the signal.
 	c.dbPath = filepath.Join(dir, "appliance.json")
-	if err := c.persist(); err != nil {
+	if err := c.persist(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.persist(); err != nil {
+	if err := c.persist(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := c.HealthSnapshot().BackupErr; got != "" {
