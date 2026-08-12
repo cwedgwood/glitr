@@ -42,7 +42,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"maps"
 	"net/http"
@@ -54,6 +53,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cwedgwood/glitr/applog"
 	"github.com/cwedgwood/glitr/lio"
 	"github.com/cwedgwood/glitr/storage"
 )
@@ -481,7 +481,10 @@ func (c *Coordinator) adoptPortals() error {
 			portalsText(c.cfg.Portals), portalsText(c.st.Portals))
 		msg := c.portalFlagIgnored
 		c.healthMu.Unlock()
-		log.Printf("appliance: %s", msg)
+		applog.Notice(context.Background(), c.logger(), eventConfigIgnored, msg,
+			"setting", "portals",
+			"flag_value", portalsText(c.cfg.Portals),
+			"recorded_value", portalsText(c.st.Portals))
 	}
 	return nil
 }
@@ -558,25 +561,26 @@ func (c *Coordinator) logOrphanPRState() {
 	}
 	orphans, err := OrphanPRState(c.cfg.DBRoot, live)
 	if err != nil {
-		log.Printf("warning: cannot check for orphaned SCSI-3 PR state: %v", err)
+		applog.Warn(context.Background(), c.logger(), eventPROrphanCheckFailed,
+			"cannot check for orphaned SCSI-3 PR state", "error", err.Error())
 		return
 	}
 	if len(orphans) == 0 {
 		return
 	}
-	log.Printf("NOTICE: %d saved SCSI-3 PR reservation file(s) belong to no existing volume. "+
-		"They are inert (only read back for a backstore with the same WWN) and are NOT removed "+
-		"automatically, because a volume can be absent temporarily (a partially restored db, a "+
-		"backstore not yet replayed) and reaping would destroy live fencing state. "+
-		"Run `applianced inspect` for the list, and remove them if the volumes are really gone.",
-		len(orphans))
-	for i, o := range orphans {
-		if i == 5 {
-			log.Printf("  ... and %d more", len(orphans)-5)
-			break
-		}
-		log.Printf("  %s", o)
-	}
+	// One record, not a header plus a line per file. A multi-line report is
+	// readable on a console and unreadable to anything else: each continuation
+	// line arrives as its own record with no field tying it to the header, so
+	// a collector interleaving two sources splits the list. The count is the
+	// field to alert on and inspect prints the list.
+	applog.Notice(context.Background(), c.logger(), eventPROrphans,
+		"saved SCSI-3 PR reservation files belong to no existing volume. "+
+			"They are inert (only read back for a backstore with the same WWN) and are NOT "+
+			"removed automatically, because a volume can be absent temporarily (a partially "+
+			"restored db, a backstore not yet replayed) and reaping would destroy live "+
+			"fencing state. Run `applianced inspect` for the list, and remove them if the "+
+			"volumes are really gone.",
+		"orphan_count", len(orphans), "db_root", c.cfg.DBRoot)
 }
 
 func (c *Coordinator) load() (existed bool, err error) {
@@ -691,7 +695,9 @@ func (c *Coordinator) adoptStorage(dbExisted bool) error {
 		if err != nil {
 			return err
 		}
-		log.Printf("warning: object directory %s has no record; set aside as %s with its data intact", d, q)
+		applog.Warn(context.Background(), c.logger(), eventStorageQuarantined,
+			"object directory has no record; set aside with its data intact",
+			"directory", d, "quarantined_as", q)
 	}
 	for _, o := range c.st.Objects {
 		if !c.store.Exists(o.UUID) {
@@ -699,8 +705,10 @@ func (c *Coordinator) adoptStorage(dbExisted bool) error {
 			// object existed, and an operator who deletes it loses the ability
 			// to tell what was lost.
 			o.State = stateMissing
-			log.Printf("warning: %s %q (%s) has a record but no backing file; marked %s",
-				o.Kind, o.Name, o.UUID, stateMissing)
+			applog.Warn(context.Background(), c.logger(), eventStorageMissing,
+				"object has a record but no backing file",
+				"resource_kind", string(o.Kind), "resource_name", o.Name,
+				"resource_id", o.UUID, "state", stateMissing)
 		}
 	}
 	return nil
@@ -1086,10 +1094,11 @@ func (c *Coordinator) commit(ctx context.Context, op *opLog, mutate func() error
 	// buy. Configfs work has to be serialised regardless, so only the
 	// non-configfs remainder is even a candidate for overlapping.
 	if total := time.Since(tCommit); total > slowCommit {
-		log.Printf("slow commit: persist=%s reconcile=%s other=%s total=%s",
-			persistFor.Round(time.Millisecond), reconcileFor.Round(time.Millisecond),
-			(total - persistFor - reconcileFor).Round(time.Millisecond),
-			total.Round(time.Millisecond))
+		applog.Notice(ctx, c.logger(), eventCommitSlow, "slow commit",
+			"persist_ms", persistFor.Milliseconds(),
+			"reconcile_ms", reconcileFor.Milliseconds(),
+			"other_ms", (total - persistFor - reconcileFor).Milliseconds(),
+			"total_ms", total.Milliseconds())
 	}
 	return err
 }
@@ -1245,8 +1254,9 @@ func (c *Coordinator) publishWithheldLocked() {
 func (c *Coordinator) storePRStrandedLocked(stranded, undecided []string) {
 	for _, s := range stranded {
 		if !slices.Contains(c.prStranded, s) {
-			log.Printf("NOTICE: SCSI-3 PR reservation is in effect but its holder "+
-				"cannot release it: %s", s)
+			applog.Notice(context.Background(), c.logger(), eventPRStranded,
+				"SCSI-3 PR reservation is in effect but its holder cannot release it",
+				"detail", s)
 		}
 	}
 	c.prStranded = stranded
@@ -1255,7 +1265,8 @@ func (c *Coordinator) storePRStrandedLocked(stranded, undecided []string) {
 	// the detector cannot see one here rather than infer that all is well.
 	for _, u := range undecided {
 		if !slices.Contains(c.prStrandUndecided, u) {
-			log.Printf("NOTICE: cannot determine whether a reservation is stranded: %s", u)
+			applog.Notice(context.Background(), c.logger(), eventPRStrandUndecided,
+				"cannot determine whether a reservation is stranded", "detail", u)
 		}
 	}
 	c.prStrandUndecided = undecided
@@ -1267,7 +1278,8 @@ func (c *Coordinator) storePRStrandedLocked(stranded, undecided []string) {
 func (c *Coordinator) storePRUnboundLocked(unbound []string) {
 	for _, u := range unbound {
 		if !slices.Contains(c.prUnbound, u) {
-			log.Printf("WARNING: SCSI-3 PR reservation NOT in effect after replay: %s", u)
+			applog.Warn(context.Background(), c.logger(), eventPRUnbound,
+				"SCSI-3 PR reservation NOT in effect after replay", "detail", u)
 		}
 	}
 	c.prUnbound = unbound
@@ -1276,7 +1288,8 @@ func (c *Coordinator) storePRUnboundLocked(unbound []string) {
 func (c *Coordinator) storeDriftLocked(rendered []string) {
 	for _, d := range rendered {
 		if !slices.Contains(c.drift, d) {
-			log.Printf("WARNING: desired attribute could not be applied: %s", d)
+			applog.Warn(context.Background(), c.logger(), eventAttributeDrift,
+				"desired attribute could not be applied", "detail", d)
 		}
 	}
 	c.drift = rendered

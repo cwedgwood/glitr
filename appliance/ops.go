@@ -5,11 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"net/http"
 	"os"
 	"slices"
 
+	"github.com/cwedgwood/glitr/applog"
 	"github.com/cwedgwood/glitr/lio"
 )
 
@@ -110,8 +110,10 @@ func (c *Coordinator) discardSavedPR(wwn string) {
 	// -- see OrphanPRState). It is logged, and the leftover is reported at
 	// the next startup and by `applianced inspect`.
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		log.Printf("warning: could not remove saved SCSI-3 PR state %s: %v "+
-			"(harmless leftover; `applianced inspect` will list it)", path, err)
+		applog.Warn(context.Background(), c.logger(), eventPRDiscardFailed,
+			"could not remove saved SCSI-3 PR state "+
+				"(harmless leftover; `applianced inspect` will list it)",
+			"path", path, "error", err.Error())
 	}
 }
 

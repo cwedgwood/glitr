@@ -149,25 +149,26 @@ func replaceAttr(groups []string, a slog.Attr) slog.Attr {
 // Install makes the logger the process default and routes the stdlib log
 // package through it.
 //
-// Routing the stdlib package matters during a phased migration: this project
-// has ~45 existing log.Printf sites whose wording is good and worth keeping.
-// They keep working and land in the same stream instead of bypassing the
-// handler and interleaving raw text with structured records.
+// Routing the stdlib package still matters: a dependency, or a site added in
+// a hurry, can call log.Printf and should land in the same stream rather than
+// bypassing the handler and interleaving raw text with structured records.
 func Install(l *slog.Logger) {
 	slog.SetDefault(l)
-	// The stdlib bridge runs at WARN, not Info, for the duration of the
-	// migration.
+	// The stdlib bridge runs at Info.
 	//
-	// slog drops a bridged record when the handler rejects its level, so at
-	// Info an operator running -log-level=warn would silently lose all ~45
-	// remaining log.Printf sites -- including the ones that say WARNING:.
-	// MEASURED: with the handler at warn, log.Printf produced an empty buffer.
+	// It ran at WARN for the duration of the migration, deliberately: slog
+	// drops a bridged record when the handler rejects its level, so at Info an
+	// operator running -log-level=warn would have silently lost the ~45
+	// log.Printf sites that existed then -- including the ones whose text said
+	// WARNING. Over-severity is visible and annoying; silent loss of a warning
+	// is not, and the loud failure is the acceptable one.
 	//
-	// Over-severity is visible and annoying; silent loss of a warning is not,
-	// and this project's whole disposition is that the loud failure is the
-	// acceptable one. Return this to LevelInfo once those sites carry their
-	// own levels.
-	slog.SetLogLoggerLevel(slog.LevelWarn)
+	// That reasoning expired when the sites did. Every anomaly the appliance
+	// reports now carries its own level and its own event name, so the blanket
+	// WARN had become the inaccuracy rather than the safeguard: it promoted
+	// anything still arriving through the bridge -- which is now only
+	// unconverted or third-party output -- to a severity nobody chose.
+	slog.SetLogLoggerLevel(slog.LevelInfo)
 	// The stdlib logger's own flags would prepend a second timestamp to a
 	// record that already carries one.
 	log.SetFlags(0)

@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"github.com/cwedgwood/glitr/applog"
 	"os"
 	"strings"
 )
@@ -161,7 +161,9 @@ func (c *Coordinator) adoptIdentity() error {
 				c.cfg.TargetIQN, iqn)
 			msg := c.iqnFlagIgnored
 			c.healthMu.Unlock()
-			log.Printf("appliance: %s", msg)
+			applog.Notice(context.Background(), c.logger(), eventConfigIgnored, msg,
+				"setting", "target_iqn",
+				"flag_value", c.cfg.TargetIQN, "recorded_value", iqn)
 		}
 	case c.cfg.TargetIQN != "":
 		iqn = c.cfg.TargetIQN
@@ -173,8 +175,9 @@ func (c *Coordinator) adoptIdentity() error {
 		// So the kernel is the record of last resort: whatever this host is
 		// already serving is what it is called.
 		iqn = c.liveTargetIQN()
-		log.Printf("appliance: adopting the target already live in the kernel (%s) as this "+
-			"appliance's recorded identity", iqn)
+		applog.Notice(context.Background(), c.logger(), eventIdentityAdopted,
+			"adopting the target already live in the kernel as this appliance's "+
+				"recorded identity", "target_iqn", iqn, "source", "kernel")
 	case actual != "":
 		iqn = DeriveTargetIQN(actual)
 	default:
@@ -197,8 +200,9 @@ func (c *Coordinator) adoptIdentity() error {
 		return fmt.Errorf("appliance: recording the target identity: %w", err)
 	}
 	if actual == "" {
-		log.Printf("appliance: no machine ID at %s, so a cloned copy of this database "+
-			"cannot be detected; target IQN is %s", c.machineIDPath(), iqn)
+		applog.Warn(context.Background(), c.logger(), eventIdentityNoMachineID,
+			"no machine ID, so a cloned copy of this database cannot be detected",
+			"machine_id_path", c.machineIDPath(), "target_iqn", iqn)
 	}
 	return nil
 }

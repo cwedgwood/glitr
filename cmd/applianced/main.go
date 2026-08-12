@@ -208,26 +208,32 @@ func serve(args []string) {
 	// included here; appliance.Open validates the complete config again.
 	parsedPortals, err2 := appliance.ParsePortals(*portals, uint16(*port))
 	if err2 != nil {
-		log.Fatalf("%v", err2)
+		fatal(logger, "lifecycle.startup_failed", "the -portals flag could not be parsed",
+			"error", err2.Error())
 	}
 	if err := (appliance.Config{
 		TargetIQN: *iqn,
 		Portals:   parsedPortals,
 	}).Validate(); err != nil {
-		log.Fatalf("%v", err)
+		fatal(logger, "lifecycle.startup_failed", "the configuration was refused",
+			"error", err.Error())
 	}
 
 	lock := hostlock.New(*lockPath)
 	if ok, err := lock.TryLock(); err != nil {
-		log.Fatalf("lock: %v", err)
+		fatal(logger, "lifecycle.startup_failed", "the host lock could not be taken",
+			"lock_path", lock.Path(), "error", err.Error())
 	} else if !ok {
-		log.Fatalf("another LIO writer holds %s (lish mutating or a second applianced?)", lock.Path())
+		fatal(logger, "lifecycle.startup_failed",
+			"another LIO writer holds the host lock (lish mutating or a second applianced?)",
+			"lock_path", lock.Path())
 	}
 	defer lock.Unlock()
 
 	store, err := storage.Open(*root)
 	if err != nil {
-		log.Fatalf("storage: %v", err)
+		fatal(logger, "lifecycle.startup_failed", "the storage root could not be opened",
+			"root", *root, "error", err.Error())
 	}
 	m := lio.New(configfs.Default())
 
@@ -243,9 +249,11 @@ func serve(args []string) {
 	// safe residue.
 	dbRoot, err := m.DBRoot()
 	if err != nil {
-		log.Fatalf("cannot locate the kernel target db_root: %v\n"+
-			"refusing to start: SCSI-3 PR reservations could not be restored, and serving "+
-			"volumes without them would let a previously-fenced initiator write again", err)
+		fatal(logger, "lifecycle.startup_failed",
+			"cannot locate the kernel target db_root; refusing to start: SCSI-3 PR "+
+				"reservations could not be restored, and serving volumes without them "+
+				"would let a previously-fenced initiator write again",
+			"error", err.Error())
 	}
 	// The kernel needs db_root/pr to exist before it can persist ANY APTPL
 	// metadata: without it filp_open fails, PR OUT is answered NOT READY, and
@@ -253,9 +261,10 @@ func serve(args []string) {
 	// provisioned before that did not, so create it here too rather than
 	// depend on a separate manual step having been run.
 	if err := os.MkdirAll(filepath.Join(dbRoot, "pr"), 0o755); err != nil {
-		log.Fatalf("cannot create %s: %v\n"+
-			"refusing to start: the kernel cannot persist SCSI-3 PR reservations without it",
-			filepath.Join(dbRoot, "pr"), err)
+		fatal(logger, "lifecycle.startup_failed",
+			"cannot create the APTPL directory; refusing to start: the kernel cannot "+
+				"persist SCSI-3 PR reservations without it",
+			"path", filepath.Join(dbRoot, "pr"), "error", err.Error())
 	}
 	m.SetAPTPLRecords(appliance.APTPLProvider(dbRoot))
 
@@ -267,10 +276,12 @@ func serve(args []string) {
 		NoUnmap:   *noUnmap,
 	}
 	if *writeBack {
-		log.Printf("WARNING: -write-back is set: writes are acknowledged from the page cache " +
-			"and are NOT durable across power loss. Volumes advertise a volatile write cache " +
-			"(WCE=1), so a consumer that flushes correctly stays consistent, but anything " +
-			"relying on an acknowledged write being on stable storage must not use this.")
+		applog.Warn(context.Background(), logger, "config.write_back_enabled",
+			"-write-back is set: writes are acknowledged from the page cache and are NOT "+
+				"durable across power loss. Volumes advertise a volatile write cache (WCE=1), "+
+				"so a consumer that flushes correctly stays consistent, but anything relying "+
+				"on an acknowledged write being on stable storage must not use this.",
+			"write_back", true)
 	}
 	c, err := appliance.Open(*root, store, m, cfg)
 	if err != nil {
@@ -279,10 +290,12 @@ func serve(args []string) {
 		// but the blast radius is the whole appliance, not the one volume.
 		// The error names the offending path, so say what to do with it --
 		// otherwise the only recovery is inferring it from the error string.
-		log.Fatalf("appliance: %v\n"+
-			"if this names a saved SCSI-3 PR state file, that volume's reservations cannot be "+
-			"restored. Removing the named file will let the appliance start WITHOUT them, which "+
-			"means anything relying on them for fencing is no longer protected.", err)
+		fatal(logger, "lifecycle.startup_failed",
+			"the appliance could not be opened. If the error names a saved SCSI-3 PR state "+
+				"file, that volume's reservations cannot be restored. Removing the named "+
+				"file will let the appliance start WITHOUT them, which means anything "+
+				"relying on them for fencing is no longer protected.",
+			"error", err.Error())
 	}
 	// The EFFECTIVE identity, asked of the coordinator, not the flag. -iqn is
 	// empty in the normal case (the name is derived and recorded), so printing
@@ -356,8 +369,10 @@ func serve(args []string) {
 			}
 		}()
 	} else {
-		log.Print("NOTICE: periodic SCSI-3 PR re-verification is DISABLED; " +
-			"pr_unbound in /health will only refresh on mutations that change the LIO config")
+		applog.Notice(context.Background(), logger, "config.pr_check_disabled",
+			"periodic SCSI-3 PR re-verification is DISABLED; pr_unbound in /health will "+
+				"only refresh on mutations that change the LIO config",
+			"pr_check_interval", "0")
 	}
 
 	// Shutdown drains in-flight HTTP handlers, and that is what waits for a
@@ -398,13 +413,16 @@ func serve(args []string) {
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
-		log.Print("shutting down")
+		sig_ := <-sig
+		applog.Info(context.Background(), logger, "lifecycle.shutdown",
+			"shutting down", "signal", sig_.String())
 		close(stopPR)
 		close(stop)
 	}()
-	if err := runServer(srv.ListenAndServe, srv, stop, drained, 5*time.Second); err != nil {
-		log.Fatal(err)
+	if err := runServer(logger, srv.ListenAndServe, srv, stop, drained, 5*time.Second); err != nil {
+		applog.Error(context.Background(), logger, "lifecycle.startup_failed",
+			"the appliance stopped serving", "error", err.Error())
+		os.Exit(1)
 	}
 }
 
@@ -420,15 +438,32 @@ func serve(args []string) {
 // budget bounds the drain. Exceeding it is logged rather than returned: the
 // process is going down either way, and startup replay converges a reconcile
 // that was interrupted (measured -- see the comment in serve).
-func runServer(serveFn func() error, srv *http.Server, stop <-chan struct{}, drained chan struct{}, budget time.Duration) error {
+// fatal reports a startup failure that the appliance cannot continue past.
+//
+// It exists because log.Fatalf, once the stdlib bridge routes through slog,
+// arrives at whatever blanket level the bridge is set to -- which was WARN and
+// is now Info. A fatal that an operator running -log-level=warn cannot see is
+// the worst possible thing to get wrong about a level, so the sites that run
+// after the logger is installed say Error for themselves and exit here.
+//
+// os.Exit, not log.Fatal, so the record is emitted through the configured
+// handler in the configured format rather than as raw text beside it.
+func fatal(logger *slog.Logger, event, msg string, args ...any) {
+	applog.Error(context.Background(), logger, event, msg, args...)
+	os.Exit(1)
+}
+
+func runServer(logger *slog.Logger, serveFn func() error, srv *http.Server, stop <-chan struct{}, drained chan struct{}, budget time.Duration) error {
 	go func() {
 		defer close(drained)
 		<-stop
 		ctx, cancel := context.WithTimeout(context.Background(), budget)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("WARNING: shutdown did not drain within %v (%v); a reconcile "+
-				"may be interrupted and will be replayed at startup", budget, err)
+			applog.Warn(context.Background(), logger, "lifecycle.drain_failed",
+				"shutdown did not drain in time; a reconcile may be interrupted and "+
+					"will be replayed at startup",
+				"budget_ms", budget.Milliseconds(), "error", err.Error())
 		}
 	}()
 	if err := serveFn(); err != nil && !errors.Is(err, http.ErrServerClosed) {

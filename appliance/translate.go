@@ -3,12 +3,12 @@ package appliance
 import (
 	"context"
 	"errors"
-	"log"
 	"maps"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/cwedgwood/glitr/applog"
 	"github.com/cwedgwood/glitr/lio"
 )
 
@@ -295,7 +295,9 @@ func (c *Coordinator) reconcile(ctx context.Context) (lio.Report, error) {
 			// reporting a failure the full path would have handled. This is
 			// what preserves self-healing if the kernel tree is lost from
 			// under a running daemon.
-			log.Printf("incremental reconcile refused (%v); falling back to a full reconcile", err)
+			applog.Info(ctx, c.logger(), eventReconcileFallback,
+				"incremental reconcile refused; falling back to a full reconcile",
+				"error", err.Error())
 			c.applied = nil
 			return c.reconcileFull(ctx, prev, desired)
 		}
@@ -330,7 +332,7 @@ func (c *Coordinator) reconcile(ctx context.Context) (lio.Report, error) {
 	c.applied = appliedView(desired, drift)
 	c.publishReconcile(nil, unbound, stranded, undecided, drift)
 	c.logReconcileOutcome(ctx, prev, nil, "incremental", rep)
-	c.logSlow(rep, "incremental")
+	c.logSlow(ctx, rep, "incremental")
 	return rep, nil
 }
 
@@ -346,7 +348,7 @@ func (c *Coordinator) reconcileFull(ctx context.Context, prev error, desired lio
 		// with a partial report. Degraded is the loud direction anyway.
 		c.publishReconcileFailure(err)
 		c.logReconcileOutcome(ctx, prev, err, "full", rep)
-		c.logSlow(rep, "full")
+		c.logSlow(ctx, rep, "full")
 		return rep, err
 	}
 	c.applied = appliedView(desired, rep.Drift)
@@ -356,14 +358,15 @@ func (c *Coordinator) reconcileFull(ctx context.Context, prev error, desired lio
 	syncStranded, syncUndecided := strandedText(c.lio.StrandedReservations(desired))
 	c.publishReconcile(nil, rep.APTPLUnbound, syncStranded, syncUndecided, rep.Drift)
 	c.logReconcileOutcome(ctx, prev, nil, "full", rep)
-	c.logSlow(rep, "full")
+	c.logSlow(ctx, rep, "full")
 	return rep, err
 }
 
-func (c *Coordinator) logSlow(rep lio.Report, kind string) {
+func (c *Coordinator) logSlow(ctx context.Context, rep lio.Report, kind string) {
 	if rep.Timings.Total() > slowReconcile {
-		log.Printf("slow %s reconcile: %s (%d exported volume(s))",
-			kind, rep.Timings, len(c.st.Exports))
+		applog.Notice(ctx, c.logger(), eventReconcileSlow, "slow reconcile",
+			"kind", kind, "timings", rep.Timings.String(),
+			"exported_count", len(c.st.Exports))
 	}
 }
 
