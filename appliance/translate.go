@@ -63,6 +63,29 @@ func (c *Coordinator) desiredLIO() lio.Config {
 			exported[cn.ObjectUUID] = true
 		}
 	}
+	// ClearReservation withholds one object for exactly one reconcile so the
+	// kernel prunes its backstore, which is the only path that frees SCSI-3
+	// registrations FROM THE TARGET SIDE (core_scsi3_free_all_registrations is
+	// reached only from target_free_device, linux v6.6
+	// drivers/target/target_core_device.c:1002).
+	//
+	// The scope matters. An INITIATOR can free them wholesale with a PR OUT
+	// CLEAR (core_scsi3_emulate_pro_clear), which is exactly the remedy
+	// lio.StrandedReservation.String() recommends -- so an unscoped claim here
+	// would contradict the advice this project gives its own operators.
+	// The mappings stay in the db throughout and come back on the next
+	// reconcile; see ClearReservation for why this is a tear-down rather than
+	// a write to some attribute.
+	if c.prClearing != "" {
+		delete(exported, c.prClearing)
+	}
+	// Objects a FAILED clear left withheld stay out until they are resolved.
+	// Every one of them, not just the current operation's: rebuilding one
+	// while its saved APTPL record is still on disk replays that record and
+	// silently restores the fence the operator asked to drop.
+	for uuid := range c.withheld {
+		delete(exported, uuid)
+	}
 
 	tpg := lio.TPG{
 		Tag:    1,

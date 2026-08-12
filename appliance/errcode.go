@@ -22,6 +22,20 @@ const (
 	CodeInternal              = "internal"
 	CodeNameTaken             = "name_taken"
 	CodeLUNRequired           = "lun_required"
+	// CodeClearUnverified means a clear-reservation tore the backstore down
+	// but could not PROVE the reservation is gone. Distinct from a plain
+	// failure: something was done, and the result is unknown.
+	CodeClearUnverified = "clear_unverified"
+	// CodeFenceDropped means a clear-reservation did not complete, but the
+	// reservation was already released before it failed. Its own code
+	// because it is the one failure a caller must NOT read as "still fenced".
+	CodeFenceDropped = "fence_dropped"
+	// CodeFenceUnknown means a clear-reservation failed AND the fence state
+	// could not be established. Distinct from both of the above: the caller
+	// must not read it as "still fenced" OR as "dropped", and must go and
+	// look. Previously these returned a bare error and reached clients as
+	// "internal", indistinguishable from a nil dereference.
+	CodeFenceUnknown = "fence_unknown"
 )
 
 // codeForStatus is the default code for an HTTP status, so every error carries

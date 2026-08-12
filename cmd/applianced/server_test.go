@@ -2,6 +2,9 @@ package main
 
 import (
 	"errors"
+	"github.com/cwedgwood/glitr/applog"
+	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -26,7 +29,7 @@ import (
 // timeout makes the test faster rather than wrong; removing it makes the test
 // fail, which is the point.
 func TestRESTServerDropsASilentClient(t *testing.T) {
-	srv := newRESTServer("127.0.0.1:0", http.NotFoundHandler())
+	srv := newRESTServer("127.0.0.1:0", http.NotFoundHandler(), testLogHandler(t))
 	if srv.ReadHeaderTimeout <= 0 {
 		t.Fatal("no ReadHeaderTimeout: a client that never sends a request line " +
 			"holds this connection forever")
@@ -72,7 +75,7 @@ func TestRESTServerDropsASilentClient(t *testing.T) {
 func TestRESTServerStillServesRealRequests(t *testing.T) {
 	srv := newRESTServer("127.0.0.1:0", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"status":"ok"}`))
-	}))
+	}), testLogHandler(t))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -181,4 +184,15 @@ func TestRunServerReturnsAListenerError(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("a serve error must not block on the drain: nothing will close stop")
 	}
+}
+
+// testLogHandler gives newRESTServer a handler for http.Server.ErrorLog
+// without putting net/http's internal chatter on the test output.
+func testLogHandler(t *testing.T) slog.Handler {
+	t.Helper()
+	_, h, err := applog.New(applog.Options{Out: io.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
 }

@@ -210,6 +210,36 @@ type Coordinator struct {
 	// means "unknown" -- at startup, or after any failure -- which forces the
 	// next reconcile to be a full one. Guarded by mu.
 	applied *lio.Config
+	// withheld is the SET of objects a failed clear deliberately left out of
+	// the desired config, keyed by UUID. No reconcile restores them until
+	// they are resolved.
+	//
+	// A SET, not a single value, and that was forced by measurement. It began
+	// as one string alongside prClearing, which meant a clear of B silently
+	// released A: desiredLIO excluded only the one current value, so B's
+	// reconcile ADDED A back (ApplyDelta applies additions before removals)
+	// while A's saved APTPL record was still on disk -- replaying it and
+	// restoring the fence the operator had asked to drop, with A's health
+	// signal erased in the same call. Worse, if A's record had been removed
+	// but its absence not PROVEN, A came back with no record at all: unfenced
+	// and unreported.
+	//
+	// Guarded by mu, because desiredLIO reads it. The published copy for
+	// /health is withheldNames, guarded by healthMu -- see the note there.
+	withheld map[string]string
+	// prClearing is the UUID of an object whose backstore is being
+	// deliberately torn down and rebuilt to drop a SCSI-3 reservation, and is
+	// the ONE thing that makes desiredLIO lie about what should exist.
+	//
+	// Deliberately in-memory and not durable. It is set and cleared inside a
+	// single ClearReservation call under mu, so no other mutation can observe
+	// it half-applied. If the daemon dies while it is set, the db is
+	// untouched and startup replay rebuilds the backstore from the durable
+	// record -- which, with the saved APTPL record already discarded, lands
+	// on exactly the outcome the operation was heading for anyway.
+	//
+	// Guarded by mu.
+	prClearing string
 	// portalFlagIgnored is set when the -portals flag disagrees with the
 	// durable record, so /health can say so.
 	//
@@ -223,6 +253,19 @@ type Coordinator struct {
 	// Reported for the same reason as portalFlagIgnored: the appliance is not
 	// running the configuration its operator believes it is.
 	iqnFlagIgnored string
+	// withheldNames is the published view of withheld, uuid -> object name,
+	// for /health. Guarded by healthMu.
+	withheldNames map[string]string
+	// clearing names the object a ClearReservation is currently tearing down
+	// and rebuilding, or "" when none is.
+	//
+	// Guarded by healthMu, NOT mu, and that is the whole point. The operation
+	// holds mu for its entire duration, so every mu-guarded signal is frozen
+	// at its pre-operation value while the object is deliberately absent from
+	// the kernel -- and /health deliberately does not take mu, so it would
+	// otherwise serve a fresh "ok" for a volume that is not presented to
+	// anyone. This is the one field that can cross that boundary and say so.
+	clearing string
 	// prStranded holds reservations that are in effect but unaddressable by
 	// their holder. Published alongside prUnbound so a reader cannot see one
 	// without the other, and stored as text because it is a report.
@@ -283,6 +326,14 @@ type Health struct {
 	// the lab both registrations were stranded at once, so nothing could
 	// locate a registration to preempt with.
 	PRStranded []string
+	// Withheld names every object that a failed clear left deliberately absent
+	// from the kernel. They stay absent until an operator resolves them, so
+	// this is a standing condition, not an event. Sorted, for a stable body.
+	Withheld []string
+	// ClearInProgress names an object whose reservation is being cleared right
+	// now, meaning it is deliberately not presented to its initiators for the
+	// duration. Empty when no clear is running.
+	ClearInProgress string
 	// PRStrandUndecided names targets where the strand question could not be
 	// answered, because the kernel holds sessions the per-ACL attributes do
 	// not render (multipath). NOT a warning: nothing is wrong with the
@@ -826,11 +877,17 @@ func (c *Coordinator) persist() error {
 	if err := os.Rename(tmp, c.dbPath); err != nil {
 		return err
 	}
-	if backupErr != nil {
-		c.healthMu.Lock()
-		c.backupErr = backupErr
-		c.healthMu.Unlock()
-	}
+	// Publish the CURRENT backup posture, success or failure.
+	//
+	// Recording only failures made the signal sticky: it survived for the life
+	// of the process even after the cause was fixed, so an operator who freed
+	// space still saw "backups are failing" until a restart. That is wrong for
+	// a field whose entire value is describing the recovery posture RIGHT NOW,
+	// and a stale alarm on a resolved condition is how a real one gets
+	// ignored. Set and cleared in one place so the two cannot drift.
+	c.healthMu.Lock()
+	c.backupErr = backupErr
+	c.healthMu.Unlock()
 	if err := syncDir(filepath.Dir(c.dbPath)); err != nil {
 		// The rename already made the new db visible, so the ON-DISK state is
 		// the NEW state; the caller must not roll memory back to the old one.
@@ -1088,6 +1145,66 @@ func (c *Coordinator) publishPRCheck(unbound, stranded, undecided []string) {
 // Logged as a NOTICE, not a WARNING: the reservation is doing its job. What
 // makes it worth saying is that its holder cannot lift it, so an operator
 // waiting for the holder to release would wait forever.
+// setClearing publishes, or withdraws, the fact that a clear is in flight.
+//
+// Separate from mu on purpose -- see the field. A caller must pair every set
+// with a deferred clear, or /health keeps warning about an operation that
+// finished.
+func (c *Coordinator) setClearing(name string) {
+	c.healthMu.Lock()
+	c.clearing = name
+	c.healthMu.Unlock()
+}
+
+// setWithheld publishes, or withdraws, an object that a failed clear left out
+// of the desired config on purpose.
+//
+// This is NOT the same as a clear in flight, and giving it its own field was
+// forced by measurement: a phase-2 failure leaves prClearing set for the life
+// of the process, and the deferred setClearing("") then removed the only
+// signal, so /health reported an ordinary "ok" while a data-bearing volume was
+// absent from every reconcile. Nothing else could report it -- the db still
+// maps the object, the last reconcile succeeded, so neither the degraded path
+// nor any PR signal fires.
+//
+// Guarded by healthMu for the same reason as clearing: mu is held for the
+// whole operation and /health does not take it.
+// holdBack records that a failed clear left an object out of the desired
+// config, and publishes it. Caller must hold c.mu.
+func (c *Coordinator) holdBack(uuid, name string) {
+	if c.withheld == nil {
+		c.withheld = map[string]string{}
+	}
+	c.withheld[uuid] = name
+	c.publishWithheldLocked()
+}
+
+// releaseHold removes ONE object from the withheld set, by UUID.
+//
+// By UUID, never wholesale: clearing the set because some other object's clear
+// succeeded is exactly the defect this replaced. Caller must hold c.mu.
+func (c *Coordinator) releaseHold(uuid string) {
+	if _, ok := c.withheld[uuid]; !ok {
+		return
+	}
+	delete(c.withheld, uuid)
+	c.publishWithheldLocked()
+}
+
+// publishWithheldLocked copies the withheld set to the health-side view.
+//
+// Two copies because the two are read under different locks: desiredLIO reads
+// withheld under mu, which the whole clear holds, while /health deliberately
+// does not take mu -- so a signal that only lived under mu could not be seen
+// during the operation it describes. Caller must hold c.mu.
+func (c *Coordinator) publishWithheldLocked() {
+	out := make(map[string]string, len(c.withheld))
+	maps.Copy(out, c.withheld)
+	c.healthMu.Lock()
+	c.withheldNames = out
+	c.healthMu.Unlock()
+}
+
 func (c *Coordinator) storePRStrandedLocked(stranded, undecided []string) {
 	for _, s := range stranded {
 		if !slices.Contains(c.prStranded, s) {
@@ -1146,6 +1263,8 @@ func (c *Coordinator) HealthSnapshot() Health {
 	defer c.healthMu.Unlock()
 	h := Health{PRUnbound: slices.Clone(c.prUnbound), PRStranded: slices.Clone(c.prStranded),
 		PRStrandUndecided: slices.Clone(c.prStrandUndecided),
+		ClearInProgress:   c.clearing,
+		Withheld:          sortedValues(c.withheldNames),
 		Drift:             slices.Clone(c.drift), CheckedAt: c.prCheckedAt}
 	h.PortalFlagIgnored = c.portalFlagIgnored
 	h.IQNFlagIgnored = c.iqnFlagIgnored
@@ -1466,4 +1585,18 @@ func strandedText(rep lio.StrandReport) (stranded, undecided []string) {
 		undecided = append(undecided, u.String())
 	}
 	return stranded, undecided
+}
+
+// sortedValues returns a map's values in a stable order, so a health body does
+// not change shape between reads for no reason.
+func sortedValues(m map[string]string) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m))
+	for _, v := range m {
+		out = append(out, v)
+	}
+	slices.Sort(out)
+	return out
 }

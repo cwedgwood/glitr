@@ -25,7 +25,17 @@ type StatusError struct {
 	// Reason is the stable machine-readable code, sent as "code" on the wire.
 	// Empty means "derive it from the status" -- see codeForStatus.
 	Reason string
+	// Err is an optional underlying error.
+	//
+	// Present so an error can carry an HTTP status AND remain matchable with
+	// errors.Is against a package sentinel. Without it the two are exclusive:
+	// attaching a status meant flattening the cause to a string, so a test or
+	// a caller could no longer ask what KIND of failure it was.
+	Err error
 }
+
+// Unwrap exposes the underlying cause to errors.Is/errors.As.
+func (e *StatusError) Unwrap() error { return e.Err }
 
 // ErrorCode returns the machine-readable code for this error, deriving one
 // from the HTTP status when none was set explicitly. Never empty, so a caller
@@ -38,6 +48,15 @@ func (e *StatusError) ErrorCode() string {
 }
 
 func (e *StatusError) Error() string { return e.Msg }
+
+// statusErrWrap is statusErrCode that also keeps a cause, so the result
+// carries a status and a machine code while still matching errors.Is.
+func statusErrWrap(status int, reason string, cause error, format string, a ...any) error {
+	e := statusErr(status, format, a...).(*StatusError)
+	e.Reason = reason
+	e.Err = cause
+	return e
+}
 
 func statusErr(code int, format string, a ...any) error {
 	return &StatusError{Code: code, Msg: fmt.Sprintf(format, a...)}
@@ -72,6 +91,12 @@ type ConnInfo struct {
 // because a metadata file could not be unlinked would turn a tidiness
 // problem into an API error. A leftover file is inert: it is only ever read
 // back for a backstore with that exact WWN.
+//
+// That argument is load-bearing and does NOT generalise. ClearReservation
+// removes the same file for a volume that is about to come BACK with the same
+// WWN, where a leftover is replayed and restores the reservation being
+// dropped -- so it uses discardSavedPRChecked, which proves the removal.
+// Do not repoint that caller here.
 func (c *Coordinator) discardSavedPR(wwn string) {
 	if c.cfg.DBRoot == "" || wwn == "" {
 		return

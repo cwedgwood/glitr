@@ -3,6 +3,7 @@ package appliance
 import (
 	"encoding/json"
 	"errors"
+	"github.com/cwedgwood/glitr/applog"
 	"net/http"
 	"strings"
 	"time"
@@ -62,6 +63,26 @@ func Handler(c *Coordinator) http.Handler {
 		// in silence.
 		if len(h.PRStrandUndecided) > 0 {
 			body["pr_strand_undecided"] = h.PRStrandUndecided
+		}
+		// A clear in flight. Reported, and counted as a warning below, because
+		// for its duration the named object is deliberately absent from the
+		// kernel while the db still maps it -- so every other signal here is
+		// computed against a desired config that is knowingly incomplete, and
+		// the reconcile inside the operation publishes an ordinary "ok" for
+		// it. Without this a monitor could read a clean bill of health for a
+		// volume its initiators cannot see.
+		if h.ClearInProgress != "" {
+			body["clear_in_progress"] = h.ClearInProgress
+		}
+		// An object a failed clear left out of the kernel on purpose. Unlike
+		// clear_in_progress this does NOT clear itself: the object stays
+		// absent from every reconcile until an operator acts, and nothing else
+		// here can report it (the db still maps it and the last reconcile
+		// succeeded, so neither degraded nor any PR signal fires). Without it
+		// /health answers "ok" for a volume its initiators cannot see, for the
+		// life of the process. MEASURED.
+		if len(h.Withheld) > 0 {
+			body["withheld_after_failed_clear"] = h.Withheld
 		}
 		// Managed attributes the kernel refused to change while the volume is
 		// exported. Reported for the same reason as pr_unbound: the tree is
@@ -128,7 +149,8 @@ func Handler(c *Coordinator) http.Handler {
 			body["status"] = "degraded"
 			body["error"] = h.Detail
 			writeJSON(w, http.StatusServiceUnavailable, body)
-		case len(h.PRUnbound) > 0 || len(h.PRStranded) > 0:
+		case len(h.Withheld) > 0 || h.ClearInProgress != "" ||
+			len(h.PRUnbound) > 0 || len(h.PRStranded) > 0:
 			body["status"] = "warning"
 			writeJSON(w, http.StatusOK, body)
 		default:
@@ -254,6 +276,29 @@ func Handler(c *Coordinator) http.Handler {
 			}
 			rescan, err := c.Resize(kind, r.PathValue("name"), req.Size)
 			respond(w, map[string]bool{"rescan_required": rescan}, http.StatusOK, err)
+		})
+
+		// Deliberately a POST to a named sub-resource and not, say, a DELETE
+		// on some /reservation object: this is an ACTION whose side effects
+		// reach well beyond the reservation -- every initiator loses the
+		// device briefly -- so repeating it is not free even though the PR
+		// state it leaves behind is the same each time.
+		//
+		// What confirm-by-name buys is narrower than "unscriptable", and the
+		// difference matters: a script that walks the collection HAS each
+		// object's name and can pass it. It stops an empty or fixed body from
+		// triggering anything, catches a name copied from the wrong row, and
+		// catches a UUID-addressed request paired with another object's name.
+		// It is a foot-gun guard, not authorization -- that is BN2.
+		mux.HandleFunc("POST /"+coll+"/{name}/clear-reservation", func(w http.ResponseWriter, r *http.Request) {
+			var req struct {
+				Confirm string `json:"confirm"`
+			}
+			if !readJSON(w, r, &req) {
+				return
+			}
+			out, err := c.ClearReservation(kind, r.PathValue("name"), req.Confirm)
+			respondCleared(w, out, err)
 		})
 
 		// --- connections, nested so the kind is unambiguous ---
@@ -387,7 +432,13 @@ func Handler(c *Coordinator) http.Handler {
 	// rather than a bare 404, because "GET /volumes returns 404" on an
 	// otherwise healthy daemon is a genuinely confusing thing to debug.
 	top := http.NewServeMux()
-	top.Handle(APIPrefix+"/", http.StripPrefix(APIPrefix, mux))
+	// CaptureRoute sits INSIDE the strip, wrapping the mux that owns the leaf
+	// patterns. An access log wrapped around the outside cannot read them:
+	// StripPrefix clones the request, so net/http records the matched pattern
+	// on a clone the outer frame never sees, leaving it only the mount
+	// pattern -- the same string for every request. It is a no-op unless an
+	// access log installed a holder in the context.
+	top.Handle(APIPrefix+"/", http.StripPrefix(APIPrefix, applog.CaptureRoute(mux)))
 	top.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		errResp(w, http.StatusNotFound, "the API is served under "+APIPrefix+"/")
 	})
@@ -463,6 +514,34 @@ func respondWithWarning(w http.ResponseWriter, v map[string]any, warning string,
 		v["warning"] = warning
 	}
 	writeJSON(w, http.StatusOK, v)
+}
+
+// respondCleared writes a clear-reservation result on BOTH the success and the
+// failure path, keeping the record either way.
+//
+// The generic respond() drops the value whenever err != nil, which is exactly
+// backwards here. ClearReservation captures the holder, ISID, type and
+// whether the saved record was discarded BEFORE it tears anything down,
+// because afterwards there is nothing left to read -- and the paths that
+// return an error are the paths where the fence may already be down and the
+// volume may not be presented. Throwing the record away there leaves the
+// operator with a sentence and no facts, at the worst possible moment. Same
+// reasoning as respondWithWarning, which exists for the disconnect path.
+func respondCleared(w http.ResponseWriter, out ClearedReservation, err error) {
+	if err != nil {
+		code, msg, reason := http.StatusInternalServerError, err.Error(), CodeInternal
+		var se *StatusError
+		if errors.As(err, &se) {
+			code, msg, reason = se.Code, se.Msg, se.ErrorCode()
+		}
+		writeJSON(w, code, struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+			ClearedReservation
+		}{msg, reason, out})
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // collectionOf is the URL collection a kind is served under.

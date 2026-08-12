@@ -126,7 +126,15 @@ func (s StrandedReservation) String() string {
 		"side. To clear it, register a new key from a CURRENT session "+
 		"(register-and-ignore-existing-key works from any session, unlike preempt, "+
 		"which needs a registration the kernel can still locate) and then preempt or "+
-		"clear; or detach the holder, which also releases it; or delete the volume",
+		"clear. Detaching the holder frees its registrations, but that is NOT a "+
+		"reliable clear on its own: if the detach removes the LAST attachment the "+
+		"backstore is pruned, and re-attaching recreates it -- at which point a "+
+		"SAVED APTPL record is replayed and the reservation comes back. MEASURED. "+
+		"To make a detach stick, the saved record has to be discarded with it. "+
+		"The appliance's clear-reservation operation does both and keeps the "+
+		"volume, its data and its mappings; deleting the volume also does both. "+
+		"All of these DROP the fence, so establish that this reservation is "+
+		"genuinely stranded rather than deliberate before using any of them",
 		s.Backstore, s.Initiator, s.WantISID, s.LiveISID, s.resTypeText())
 }
 

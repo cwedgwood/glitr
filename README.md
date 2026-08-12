@@ -118,10 +118,11 @@ that supports `FICLONE`, such as XFS or Btrfs.
 
 ## State, honestly
 
-The code is working and has been exercised against a real kernel — twelve live
-suites and roughly 260 assertions, on an Azure Linux 3.0 target with two Debian
+The code is working and has been exercised against a real kernel — fourteen
+live suites and 303 assertions, on an Azure Linux 3.0 target with two Debian
 initiators driving genuine iSCSI sessions, including reservation conflicts,
-multipath failover and fencing across a reboot.
+multipath failover, fencing across a reboot, and breaking a reservation
+deliberately and proving the previously-fenced node can then write.
 
 **That harness is not in this repository yet.** What ships here is the code it
 tested, plus unit and fuzz tests you can run anywhere with `go test ./...`. The
