@@ -362,7 +362,7 @@ func serve(args []string) {
 			for {
 				select {
 				case <-t.C:
-					c.RecheckPR()
+					c.RecheckPR(context.Background())
 				case <-stopPR:
 					return
 				}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 
 	"github.com/cwedgwood/glitr/applog"
 	"github.com/cwedgwood/glitr/lio"
@@ -366,3 +367,147 @@ const (
 	eventConfigPRCheckOff     = "config.pr_check_disabled"
 	eventStartupFailed        = "lifecycle.startup_failed"
 )
+
+// --- health transitions ---
+
+// Health verdicts, as served on /health.
+const (
+	healthOK       = "ok"
+	healthWarning  = "warning"
+	healthDegraded = "degraded"
+)
+
+// Status is the top-level verdict for a health snapshot.
+//
+// A method on Health rather than a switch inside the /health handler, which is
+// where it used to live, because the transition event has to agree with what
+// /health serves. Two copies of this rule would eventually disagree, and the
+// disagreement would be invisible: the log would announce a recovery for an
+// appliance still serving "warning", or the reverse.
+//
+// Still HTTP 200 for a warning at the handler -- the appliance IS alive and
+// serving -- but that is the handler's business, not this rule's.
+func (h Health) Status() string {
+	switch {
+	case h.Degraded:
+		return healthDegraded
+	case len(h.Withheld) > 0 || h.ClearInProgress != "" ||
+		len(h.PRUnbound) > 0 || len(h.PRStranded) > 0:
+		return healthWarning
+	}
+	return healthOK
+}
+
+// Conditions names the standing conditions currently reported, using the same
+// keys /health serves so a consumer needs no mapping table.
+//
+// Includes conditions that do NOT raise the verdict -- attribute_drift,
+// db_backup_failing, quarantined_volume_dirs and the rest. Their edges are
+// exactly what a consumer cannot otherwise see: they never change status, so
+// without this the only way to notice one arriving or clearing is to have been
+// polling at the time.
+func (h Health) Conditions() []string {
+	var out []string
+	add := func(name string, present bool) {
+		if present {
+			out = append(out, name)
+		}
+	}
+	add("pr_unbound", len(h.PRUnbound) > 0)
+	add("pr_stranded", len(h.PRStranded) > 0)
+	add("pr_strand_undecided", len(h.PRStrandUndecided) > 0)
+	add("clear_in_progress", h.ClearInProgress != "")
+	add("withheld_after_failed_clear", len(h.Withheld) > 0)
+	add("attribute_drift", len(h.Drift) > 0)
+	add("db_backup_failing", h.BackupErr != "")
+	add("quarantined_volume_dirs", len(h.Quarantined) > 0)
+	add("portal_flag_ignored", h.PortalFlagIgnored != "")
+	add("iqn_flag_ignored", h.IQNFlagIgnored != "")
+	slices.Sort(out)
+	return out
+}
+
+// noteHealth logs a change in the published health verdict or in the set of
+// standing conditions.
+//
+// The FALLING edge is why this exists. A consumer that starts polling after a
+// condition arose cannot tell "never happened" from "resolved before I
+// looked", and every condition here is one an operator is expected to act on.
+//
+// Deliberately NOT rate-limited, though a flapping condition could in
+// principle produce a record per reconcile. Rate limiting drops edges, and the
+// edge that would be dropped is as likely to be the recovery as the failure --
+// which would reintroduce the exact gap this closes. Flapping is bounded by
+// how often a reconcile or a PR re-check runs, and a condition that really is
+// flapping is itself worth seeing.
+//
+// Must NOT be called with healthMu held: it takes a snapshot, which takes that
+// lock.
+func (c *Coordinator) noteHealth(ctx context.Context) {
+	h := c.HealthSnapshot()
+	status, conds := h.Status(), h.Conditions()
+
+	c.healthMu.Lock()
+	prevStatus, prevConds := c.lastStatus, c.lastConditions
+	first := prevStatus == ""
+	c.lastStatus, c.lastConditions = status, conds
+	c.healthMu.Unlock()
+
+	if first {
+		// Startup is not a transition. Announcing one would report every
+		// condition an appliance came up with as newly arrived, which is the
+		// opposite of what an edge means -- lifecycle.start already says what
+		// it started as.
+		return
+	}
+	added, cleared := diffConditions(prevConds, conds)
+	if status == prevStatus && len(added) == 0 && len(cleared) == 0 {
+		return
+	}
+
+	attrs := []any{"from", prevStatus, "to", status}
+	if len(added) > 0 {
+		attrs = append(attrs, "fields_added", added)
+	}
+	if len(cleared) > 0 {
+		attrs = append(attrs, "fields_cleared", cleared)
+	}
+	msg := "health changed from " + prevStatus + " to " + status
+	if status == prevStatus {
+		msg = "health conditions changed, verdict still " + status
+	}
+	// Worse is a warning, better or sideways is not. A recovery logged at warn
+	// would page somebody to tell them it stopped.
+	if healthRank(status) > healthRank(prevStatus) {
+		applog.Warn(ctx, c.logger(), eventHealthChanged, msg, attrs...)
+		return
+	}
+	applog.Info(ctx, c.logger(), eventHealthChanged, msg, attrs...)
+}
+
+// healthRank orders the verdicts so a transition can be called better or worse.
+func healthRank(s string) int {
+	switch s {
+	case healthDegraded:
+		return 2
+	case healthWarning:
+		return 1
+	}
+	return 0
+}
+
+// diffConditions reports which conditions arrived and which cleared. Both
+// inputs are sorted.
+func diffConditions(prev, now []string) (added, cleared []string) {
+	for _, n := range now {
+		if !slices.Contains(prev, n) {
+			added = append(added, n)
+		}
+	}
+	for _, p := range prev {
+		if !slices.Contains(now, p) {
+			cleared = append(cleared, p)
+		}
+	}
+	return added, cleared
+}
