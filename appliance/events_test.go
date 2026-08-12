@@ -122,25 +122,57 @@ func TestCreateEmitsAnOperationEvent(t *testing.T) {
 	}
 }
 
-// TestASnapshotReportsItsOwnEvent. The two share an implementation, and
+// TestASnapshotReportsItsOwnEvent. The two kinds share an implementation, and
 // flattening them into one event name would make a consumer parse a field to
 // learn what happened.
+//
+// Deliberately creates the snapshot with NO source, so it needs no reflink and
+// runs everywhere. The claim under test is that the event name follows the
+// kind; making it depend on FICLONE would mean this passed locally and was
+// skipped on the CI that actually gates the merge -- which is the same as not
+// asserting it.
 func TestASnapshotReportsItsOwnEvent(t *testing.T) {
 	c, e := eventCoordinator(t)
 
 	if _, _, err := c.Create(context.Background(), KindVolume,
-		CreateRequest{Name: "src", Size: MinVolumeSize}); err != nil {
+		CreateRequest{Name: "vol-1", Size: MinVolumeSize}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := c.Create(context.Background(), KindSnapshot,
+		CreateRequest{Name: "snap", Size: MinVolumeSize}); err != nil {
+		t.Fatal(err)
+	}
+
+	want(t, e.one(t, "snapshot.create"), "resource_name", "snap")
+	want(t, e.one(t, "volume.create"), "resource_name", "vol-1")
+}
+
+// TestACloneNamesItsSource covers the provenance fields, which only a real
+// copy produces.
+//
+// This one genuinely needs a reflink filesystem, so it skips where there is
+// none -- CI runs on ext4. Kept separate from the test above precisely so that
+// skip costs only the provenance assertions and not the event-naming claim.
+func TestACloneNamesItsSource(t *testing.T) {
+	c, e := eventCoordinator(t)
+
+	src, _, err := c.Create(context.Background(), KindVolume,
+		CreateRequest{Name: "src", Size: MinVolumeSize})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := c.Create(context.Background(), KindSnapshot,
 		CreateRequest{Name: "snap", Source: "src", SourceKind: KindVolume}); err != nil {
-		t.Fatal(err)
+		t.Skipf("a clone needs a reflink filesystem: %v", err)
 	}
 
 	m := e.one(t, "snapshot.create")
 	want(t, m, "source_name", "src")
 	want(t, m, "source_kind", string(KindVolume))
-	e.one(t, "volume.create") // and the source's own event is separate
+	// The uuid too: a source can be renamed, or deleted, after the copy is
+	// made, and then the name in this record resolves to nothing or to
+	// something else.
+	want(t, m, "source_id", src.UUID)
 }
 
 // TestAdoptionIsNotACreation. created=false is the same distinction the
