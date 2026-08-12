@@ -267,7 +267,14 @@ func (c *Coordinator) logReconcileOutcome(ctx context.Context, prev, err error, 
 			// /health. The edge is the event.
 			return
 		}
-		attrs := append([]any{"kind", kind, "error", err.Error()}, lioFields(err)...)
+		// changes_applied on a FAILURE is not a curiosity. ApplyDelta is
+		// fail-stop and not transactional, so a failed reconcile has usually
+		// applied some of its changes and stopped partway; the count says how
+		// far it got, which is the difference between "nothing happened" and
+		// "the tree is halfway between two configurations".
+		attrs := append([]any{
+			"kind", kind, "error", err.Error(), "changes_applied", len(rep.Changes),
+		}, lioFields(err)...)
 		applog.Error(ctx, c.logger(), eventReconcileFailed,
 			"reconcile failed; the kernel may not match the durable database", attrs...)
 	case prev != nil:
