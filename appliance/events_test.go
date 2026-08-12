@@ -279,9 +279,12 @@ func TestReconcileReportsBothEdges(t *testing.T) {
 	boom := errors.New("configfs is unreachable")
 
 	// Rise.
-	c.setReconcileErr(context.Background(), boom, "full", lio.Report{})
+	c.setReconcileErr(context.Background(), boom, "full", lio.Report{Changes: []string{"a", "b"}})
 	m := e.one(t, eventReconcileFailed)
 	want(t, m, "level", "ERROR")
+	// ApplyDelta is fail-stop and not transactional, so how far it got is a
+	// fact about the kernel, not a statistic.
+	want(t, m, "changes_applied", float64(2))
 
 	// Still broken: no second record. A wedged kernel must not become a log
 	// flood, and the condition is already standing in /health.
@@ -408,4 +411,89 @@ func TestHealthStatusMatchesWhatHealthServes(t *testing.T) {
 			t.Errorf("%s: Status() = %q, want %q", tc.name, got, tc.want)
 		}
 	}
+}
+
+// TestPartialIsWhatADurableChangeWithAFailureReports.
+//
+// This is the distinction the whole issue turns on. A mutation commits before
+// it reconciles, so a call can return an error over a change that is on disk
+// and will be replayed at the next start. Reporting that as "failed" would
+// invite a controller to recreate an object that already exists, or to assume
+// old state that is gone.
+//
+// Driven through opLog directly because the two ways to reach it -- a
+// directory fsync that fails after a successful rename, and a reconcile that
+// fails after a durable commit -- both need either a kernel or an induced
+// filesystem fault, and neither is what this asserts. What this asserts is the
+// classification, which is the part that decides what a consumer does.
+func TestPartialIsWhatADurableChangeWithAFailureReports(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		persisted bool
+		proven    bool
+		reconcile string
+		err       error
+		outcome   string
+		level     string
+	}{
+		{"clean success", true, true, reconcileNotRequired, nil, outcomeSucceeded, "INFO"},
+		{"refused before anything happened", false, false, reconcileNotRequired,
+			statusErrCode(400, CodeInvalidInput, "no"), outcomeFailed, "INFO"},
+		{"durable, but the reconcile failed", true, true, reconcileFailed,
+			errors.New("configfs is unreachable"), outcomePartial, "WARN"},
+		{"on disk, but not proven durable", true, false, reconcileNotRequired,
+			errPersistedNotDurable, outcomePartial, "WARN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, e := eventCoordinator(t)
+			ev := c.beginOp(context.Background(), "volume.create")
+			ev.noteCommit(tc.persisted, tc.proven)
+			ev.noteReconcile(tc.reconcile)
+			ev.finish(tc.err)
+
+			m := e.one(t, "volume.create")
+			want(t, m, "outcome", tc.outcome)
+			want(t, m, "level", tc.level)
+			want(t, m, "durable", tc.persisted)
+			want(t, m, "durable_proven", tc.proven)
+			want(t, m, "reconcile_outcome", tc.reconcile)
+			want(t, m, "reconciled", tc.reconcile == reconcileSucceeded)
+		})
+	}
+}
+
+// TestNotDurableIsItsOwnEventBesideThePartialOutcome.
+//
+// The operation event says the outcome was partial; this says which part. Warn
+// rather than error because the change IS in effect -- only its survival
+// across a power cut in the next moments is unproven.
+func TestNotDurableIsItsOwnEventBesideThePartialOutcome(t *testing.T) {
+	c, e := eventCoordinator(t)
+	c.logNotDurable(context.Background(), errors.New("fsync: input/output error"))
+
+	m := e.one(t, eventCommitNotDurable)
+	want(t, m, "level", "WARN")
+	if !strings.Contains(m["msg"].(string), "not proven durable") {
+		t.Errorf("the message does not say what is unproven: %v", m)
+	}
+}
+
+// TestAFenceReleaseIsAttributableToItsRequest.
+//
+// It is emitted BEFORE the commit -- the reservation it reports exists only
+// while the ACLs do -- so it cannot be a field on the operation event alone.
+// What it can be is joinable, which is what it was not: two operators
+// detaching two hosts produced two bare warnings and no way to tell which was
+// whose.
+func TestAFenceReleaseIsAttributableToItsRequest(t *testing.T) {
+	c, e := eventCoordinator(t)
+	ctx := applog.WithRequestID(context.Background(), "req-7")
+
+	c.logFenceReleased(ctx, "detaching holder releases the reservation on vol-1",
+		"volume", "vol-1", "uuid-1")
+
+	m := e.one(t, eventPRReleased)
+	want(t, m, "request_id", "req-7")
+	want(t, m, "resource_name", "vol-1")
+	want(t, m, "level", "WARN")
 }
