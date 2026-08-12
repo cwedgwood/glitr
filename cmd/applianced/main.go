@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,6 +38,7 @@ import (
 	"time"
 
 	"github.com/cwedgwood/glitr/appliance"
+	"github.com/cwedgwood/glitr/applog"
 	"github.com/cwedgwood/glitr/hostlock"
 	"github.com/cwedgwood/glitr/lio"
 	"github.com/cwedgwood/glitr/lio/configfs"
@@ -173,7 +175,25 @@ func serve(args []string) {
 			"disk and claims to be fully provisioned on the wire, so the pool can fill "+
 			"up with space nothing will ever give back. Set it only where the backing "+
 			"filesystem cannot punch holes.")
+	logFormat := fs.String("log-format", "text",
+		"log output format: text or json. Text is the default deliberately -- these "+
+			"logs are read on a console and by journald at least as often as by a "+
+			"collector, and a logging change must not silently alter the output of a "+
+			"running deployment.")
+	logLevel := fs.String("log-level", "info",
+		"log level: debug, info, notice, warn or error. notice sits above info and "+
+			"is used for conditions an operator should see that are not faults -- a "+
+			"stranded reservation is still enforcing, so warn would be a false alert.")
 	parseFlags(fs, args)
+
+	logger, logHandler, err := applog.New(applog.Options{Format: *logFormat, Level: *logLevel})
+	if err != nil {
+		// Before Install, so this lands on stderr whatever the flag said.
+		log.Fatalf("%v", err)
+	}
+	applog.Install(logger)
+
+	version, commit, goVersion := applog.BuildInfo()
 
 	// Check the settings BEFORE taking the host lock or touching the kernel.
 	//
@@ -186,9 +206,9 @@ func serve(args []string) {
 	//
 	// DBRoot is discovered below rather than configured, so it is not
 	// included here; appliance.Open validates the complete config again.
-	parsedPortals, err := appliance.ParsePortals(*portals, uint16(*port))
-	if err != nil {
-		log.Fatalf("%v", err)
+	parsedPortals, err2 := appliance.ParsePortals(*portals, uint16(*port))
+	if err2 != nil {
+		log.Fatalf("%v", err2)
 	}
 	if err := (appliance.Config{
 		TargetIQN: *iqn,
@@ -269,8 +289,26 @@ func serve(args []string) {
 	// the flag announced an appliance with no target at all -- and after a
 	// reinit it would have announced the old name while serving the new one.
 	liveIQN, livePortals := c.Target()
-	log.Printf("glitr appliance: target %s, portals %s, REST on %s",
-		liveIQN, portalList(livePortals), *listen)
+	// lifecycle.start carries the EFFECTIVE configuration and the build.
+	//
+	// The build fields matter more than they look: a journal spanning an
+	// upgrade otherwise cannot attribute a line to a binary, which is exactly
+	// when attribution is worth having. The config echo is the effective one
+	// -- asked of the coordinator, not read back from the flags -- because the
+	// recorded identity wins over -iqn, and announcing the flag would name a
+	// target the appliance is not serving.
+	applog.Info(context.Background(), logger, "lifecycle.start", "glitr appliance started",
+		"target_iqn", liveIQN,
+		"portals", portalList(livePortals),
+		"listen", *listen,
+		"root", *root,
+		"write_back", *writeBack,
+		"no_unmap", *noUnmap,
+		"pr_recheck_interval", prInterval.String(),
+		"version", version,
+		"commit", commit,
+		"go_version", goVersion,
+	)
 
 	// Bound every phase of a connection's life. Without these a client that
 	// connects and then stops -- a half-open TCP session after a partition, a
@@ -284,7 +322,11 @@ func serve(args []string) {
 	// only one that could truncate a legitimate response, and there is nothing
 	// for it to truncate -- but it is set well above any observed operation so
 	// that stays true if one gets slower.
-	srv := newRESTServer(*listen, appliance.Handler(c))
+	// The access log wraps the whole API. It is the appliance's only
+	// accountability record: the REST API is unauthenticated by design, so
+	// without it nothing traces who asked for what -- including the requests
+	// that drop fencing.
+	srv := newRESTServer(*listen, applog.AccessLog(logger, appliance.Handler(c)), logHandler)
 
 	// Periodically re-verify the saved SCSI-3 PR state against the kernel.
 	//
@@ -777,10 +819,16 @@ func extraArgsError(fs *flag.FlagSet) error {
 // one that could truncate a legitimate response, and there is nothing here for
 // it to truncate -- it is set far above any observed operation so that stays
 // true if one gets slower.
-func newRESTServer(addr string, h http.Handler) *http.Server {
+func newRESTServer(addr string, h http.Handler, lh slog.Handler) *http.Server {
 	return &http.Server{
-		Addr:              addr,
-		Handler:           h,
+		Addr:    addr,
+		Handler: h,
+		// Without this, net/http writes its own errors -- including
+		// "http: panic serving" and a full stack -- to the stdlib DEFAULT
+		// logger, bypassing the handler. Under -log-format json that
+		// interleaves raw text into the stream at the one moment a consumer
+		// most needs to parse it.
+		ErrorLog:          applog.ServerErrorLog(lh),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,

@@ -560,3 +560,72 @@ func TestFailedMutationWithoutAWarning(t *testing.T) {
 		t.Errorf("the status and code must survive: %+v", e)
 	}
 }
+
+// TestHealthDecodesWithheldAsAList: the appliance can withhold more than one
+// object at a time, so it emits an array. A scalar field here decoded to the
+// zero value against that array, losing the verdict's cause at exactly the
+// moment a failed clear had withheld something.
+func TestHealthDecodesWithheldAsAList(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"status":"warning","withheld_after_failed_clear":["vol-a","vol-b"]}`)
+	})
+
+	h, err := c.Health(context.Background())
+	if err != nil {
+		t.Fatalf("a warning body carrying a withheld list must decode: %v", err)
+	}
+	if len(h.Withheld) != 2 {
+		t.Fatalf("withheld_after_failed_clear did not decode: %+v", h.Withheld)
+	}
+	if h.Withheld[0] != "vol-a" || h.Withheld[1] != "vol-b" {
+		t.Errorf("withheld = %v", h.Withheld)
+	}
+}
+
+// TestHealthDecodesTheBackupSignal is the regression test for a signal the
+// client silently dropped.
+//
+// db_backup_failing was the one field the appliance emits that had no member
+// on Health, so encoding/json discarded it. Combined with the appliance
+// deliberately leaving status "ok" -- correctly, since the tree and the
+// database agree and every operation is still safe -- a consumer polling
+// through this client saw a healthy appliance with every field empty, and had
+// no path by which to notice that the documented "restore a backup" recovery
+// had quietly stopped being possible.
+func TestHealthDecodesTheBackupSignal(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"status":"ok","db_backup_failing":"link /db.bak: no space left on device"}`)
+	})
+
+	h, err := c.Health(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.Status != "ok" {
+		t.Errorf("status = %q, want ok -- a failing backup is deliberately not "+
+			"part of the verdict, which is exactly why the field must decode", h.Status)
+	}
+	if h.DBBackupFailing == "" {
+		t.Fatal("db_backup_failing was dropped on decode; a consumer cannot " +
+			"distinguish this appliance from a healthy one")
+	}
+	if !strings.Contains(h.DBBackupFailing, "no space left") {
+		t.Errorf("the reason must survive decode, got %q", h.DBBackupFailing)
+	}
+}
+
+// TestHealthLeavesTheBackupSignalEmptyWhenAbsent is the counter-test: the
+// field must not become permanent background noise on a healthy appliance.
+func TestHealthLeavesTheBackupSignalEmptyWhenAbsent(t *testing.T) {
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"status":"ok"}`)
+	})
+
+	h, err := c.Health(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.DBBackupFailing != "" {
+		t.Errorf("db_backup_failing = %q for a body that did not carry it", h.DBBackupFailing)
+	}
+}

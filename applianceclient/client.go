@@ -116,7 +116,35 @@ type Health struct {
 	// ACL and the initiator holds several (multipath). It is NOT a fault and
 	// does not make Status a warning: nothing is wrong with the reservation.
 	PRStrandUndecided []string `json:"pr_strand_undecided,omitempty"`
-	AttributeDrift    []string `json:"attribute_drift,omitempty"`
+	// ClearInProgress names an object whose reservation is being cleared right
+	// now. It is deliberately not presented to its initiators for the
+	// duration, and the appliance reports status "warning" while it is set.
+	ClearInProgress string `json:"clear_in_progress,omitempty"`
+	// Withheld names an object that a FAILED clear left deliberately absent
+	// from the kernel. Unlike ClearInProgress this does not clear itself: no
+	// reconcile will restore the object until an operator removes the saved
+	// APTPL record named in the failing response and re-runs the clear.
+	// A LIST, matching the appliance: more than one object can be withheld at
+	// once, and a scalar here decoded to the zero value against a JSON array,
+	// losing the signal entirely at the moment it exists.
+	Withheld []string `json:"withheld_after_failed_clear,omitempty"`
+	// DBBackupFailing reports that the appliance can no longer keep a backup
+	// of its record database. Empty when backups are being written.
+	//
+	// The appliance deliberately leaves status "ok" for this, and that is
+	// correct: the kernel tree and the database agree, so every operation is
+	// still safe. But it makes this the one signal a consumer has to read
+	// explicitly, because nothing else will raise it -- and the only one worth
+	// acting on BEFORE it matters. The database is the sole place the
+	// volume -> WWN -> backing-file mapping lives, so losing it without a
+	// backup leaves the data present and nothing able to say which volume is
+	// which.
+	//
+	// It had no field here at all, so encoding/json discarded it and a
+	// consumer polling through this client saw a healthy appliance with every
+	// field empty.
+	DBBackupFailing string   `json:"db_backup_failing,omitempty"`
+	AttributeDrift  []string `json:"attribute_drift,omitempty"`
 	// PortalFlagIgnored and IQNFlagIgnored are set when the appliance was
 	// started with a -portals or -iqn that disagrees with what it has
 	// recorded. Neither is an error -- the record wins by design -- but an
@@ -179,6 +207,16 @@ const (
 	CodeInternal              = "internal"
 	CodeNameTaken             = "name_taken"
 	CodeLUNRequired           = "lun_required"
+	// CodeClearUnverified: a clear tore the backstore down but could not
+	// prove the reservation is gone. Something was done; the result is not
+	// established.
+	CodeClearUnverified = "clear_unverified"
+	// CodeFenceDropped: a clear did NOT complete, but the reservation was
+	// already released before it failed. Must NOT be read as "still fenced".
+	CodeFenceDropped = "fence_dropped"
+	// CodeFenceUnknown: a clear failed and the fence state could not be
+	// established. Read it as neither fenced nor unfenced, and go and look.
+	CodeFenceUnknown = "fence_unknown"
 )
 
 // Client talks to one appliance.
@@ -518,6 +556,54 @@ func (c *Client) Resize(ctx context.Context, kind Kind, ref string, size int64) 
 	var r ResizeResponse
 	err := c.do(ctx, http.MethodPost, []string{collection(kind), ref, "resize"}, nil,
 		map[string]int64{"size": size}, &r)
+	return r, err
+}
+
+// ClearedReservation describes a reservation that ClearReservation dropped.
+type ClearedReservation struct {
+	Object string `json:"object"`
+	// Held reports whether a reservation was actually in effect. Only
+	// meaningful when HeldKnown is true.
+	Held bool `json:"held"`
+	// HeldKnown reports whether the pre-clear state could be read at all.
+	// When false, Held is false because the state was unreadable -- NOT
+	// because nothing was held. Do not conflate them: that reads "no fence
+	// was broken" at the moment one may have been.
+	HeldKnown bool   `json:"held_known"`
+	Holder    string `json:"holder,omitempty"`
+	// ISID is the session the registration was bound to. Empty means it was
+	// not session-bound, not that it is unknown.
+	ISID string `json:"isid,omitempty"`
+	Type string `json:"type,omitempty"`
+	// SavedRecordDiscarded reports whether a saved APTPL record was removed,
+	// which is what makes the clear survive the backstore rebuild.
+	SavedRecordDiscarded bool `json:"saved_record_discarded"`
+	// Warning is never empty on success: at minimum it says that initiators
+	// saw the device disappear and return.
+	Warning string `json:"warning,omitempty"`
+}
+
+// ClearReservation breaks a SCSI-3 persistent reservation on one object,
+// keeping the object, its data, its WWN and its mappings.
+//
+// This is a deliberate fence-dropping act and is never safe to automate. The
+// kernel offers no way to release another initiator's reservation, so the
+// appliance destroys and rebuilds the backstore -- meaning every initiator
+// using this object sees the device disappear and return, and anything holding
+// it open sees I/O errors. confirm must equal the object's name.
+//
+// Not an error when nothing was reserved; the guarantee is that no reservation
+// remains afterwards, which is also what clears leftover registrations.
+//
+// The appliance FAILS this call rather than reporting success when it cannot
+// prove the result -- an unreadable reservation state, a holder that survived,
+// or registrations that did not go. A returned error therefore means "not
+// proven clear", not necessarily "nothing happened": check the returned
+// record, which is populated on failure paths too.
+func (c *Client) ClearReservation(ctx context.Context, kind Kind, ref, confirm string) (ClearedReservation, error) {
+	var r ClearedReservation
+	err := c.do(ctx, http.MethodPost, []string{collection(kind), ref, "clear-reservation"}, nil,
+		map[string]string{"confirm": confirm}, &r)
 	return r, err
 }
 

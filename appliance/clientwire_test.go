@@ -1,8 +1,12 @@
 package appliance
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"github.com/cwedgwood/glitr/applog"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -309,5 +313,110 @@ func TestPublishedClientKeepsTheWarningOnAFailedDisconnect(t *testing.T) {
 	}
 	if !strings.Contains(resp.Warning, "RELEASED") {
 		t.Errorf("the result is not zero just because the call failed: %+v", resp)
+	}
+}
+
+// TestClearedReservationMatchesTheWireFormat covers the newest hand-copied
+// struct, for the reason this file exists: applianceclient.ClearedReservation
+// is a copy of the appliance's, not an alias, so a drifted JSON tag would
+// decode as a zero value with nothing failing at compile time.
+//
+// Zero values are the whole risk here. This type reports whether a fence was
+// broken and whether the saved record that would restore it was discarded --
+// a tag that silently decoded to false would tell an operator "nothing was
+// held, nothing was discarded" about an operation that did both.
+func TestClearedReservationMatchesTheWireFormat(t *testing.T) {
+	c := bareCoordinator(t)
+	srv := httptest.NewServer(Handler(c))
+	defer srv.Close()
+
+	cl, err := applianceclient.New(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	v, _, err := cl.CreateVolume(ctx, applianceclient.CreateRequest{Name: "wire-clear", Size: 1 << 20})
+	if err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+
+	// Wrong confirmation: proves the endpoint is reachable through the client
+	// and that a refusal is surfaced as an error rather than a zero result.
+	if _, err := cl.ClearReservation(ctx, applianceclient.KindVolume, v.Name, "not-the-name"); err == nil {
+		t.Fatal("an unconfirmed clear must be refused through the client too")
+	}
+
+	// The clear itself cannot succeed against a temp directory (the rebuild
+	// needs configfs), and that is exactly the case worth asserting: the
+	// appliance now serves the record on the FAILURE path, and the client
+	// decodes it there. Before respondCleared it served only {error, code},
+	// so everything below decoded as a zero value at the one moment the
+	// fence may already be down.
+	out, err := cl.ClearReservation(ctx, applianceclient.KindVolume, v.Name, v.Name)
+	if err == nil {
+		t.Fatal("expected the rebuild to fail against a temp directory; if this " +
+			"now succeeds the assertions below need revisiting")
+	}
+	if out.Object != v.Name {
+		t.Errorf("object did not decode on the failure path: got %q, want %q -- "+
+			"either the json tag drifted or the error response dropped the record",
+			out.Object, v.Name)
+	}
+	// The volume is unattached, so nothing is held -- but the state WAS
+	// readable, and that must be reported as knowledge rather than as the zero
+	// value, which means "could not tell".
+	if !out.HeldKnown {
+		t.Error("held_known did not decode; false here means 'could not tell', " +
+			"which is not what happened")
+	}
+	if out.Held {
+		t.Error("held decoded true for a volume with no reservation")
+	}
+	if out.Warning == "" {
+		t.Error("warning did not decode on the failure path")
+	}
+}
+
+// TestAccessLogSeesTheLeafRoute drives the access log against the REAL
+// Handler, not a stand-in.
+//
+// The applog package can only test its own idea of the topology. This asserts
+// the wiring: appliance.Handler mounts the API behind http.StripPrefix, which
+// clones the request, so a leaf pattern is written on a clone the access log
+// never sees. Without CaptureRoute inside the strip, every request in
+// production logs the mount pattern "/v1/" -- one useless string for the whole
+// API -- while a package-level test using a bare mux passes. That happened.
+func TestAccessLogSeesTheLeafRoute(t *testing.T) {
+	c := bareCoordinator(t)
+	var buf bytes.Buffer
+	l, _, err := applog.New(applog.Options{Format: "json", Out: &buf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(applog.AccessLog(l, Handler(c)))
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/v1/volumes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	var m map[string]any
+	line := strings.TrimSpace(buf.String())
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	if err := json.Unmarshal([]byte(line), &m); err != nil {
+		t.Fatalf("access record is not JSON: %v: %s", err, line)
+	}
+	route, _ := m["route"].(string)
+	if route == "/v1/" || route == "" {
+		t.Fatalf("route = %q -- the leaf pattern did not reach the access log, so "+
+			"every request in production logs the same string", route)
+	}
+	if !strings.Contains(route, "volumes") {
+		t.Errorf("route = %q, want the matched leaf pattern", route)
 	}
 }

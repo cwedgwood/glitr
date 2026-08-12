@@ -362,6 +362,11 @@ func (c *Coordinator) Delete(kind Kind, ref string) error {
 		return err
 	}
 	c.discardSavedPR(wwn)
+	// A deleted object cannot still be withheld. Leaving the hold would keep
+	// /health reporting a standing condition for something that no longer
+	// exists, and would leave a UUID in the set that desiredLIO excludes
+	// forever.
+	c.releaseHold(uuid)
 	return c.store.Delete(uuid)
 }
 
