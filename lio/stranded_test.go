@@ -1,6 +1,7 @@
 package lio
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,16 @@ func stageStrandedFull(t *testing.T, holderLine, sessionISID, resType string) (C
 	}
 
 	stageACL(t, root, strandedTargetIQN, 1, strandedInitiator, sessionISID)
+	// The kernel publishes how many sessions are live, and the check compares
+	// against it: without this the fixture describes a target whose session
+	// count cannot be read, which is deliberately undecidable rather than
+	// stranded. One session, one visible ACL -- the case where a mismatch IS
+	// evidence.
+	live := 0
+	if sessionISID != "" {
+		live = 1
+	}
+	stageSessionCount(t, root, strandedTargetIQN, live)
 
 	cfg := Config{
 		Backstores: []Backstore{b},
@@ -86,12 +97,25 @@ func stageACL(t *testing.T, root, iqn string, tag int, initiator, sessionISID st
 	}
 }
 
+// stageSessionCount writes the target's live session count exactly where the
+// kernel publishes it.
+func stageSessionCount(t *testing.T, root, iqn string, n int) {
+	t.Helper()
+	dir := filepath.Join(append([]string{root}, append(targetPath(iqn), "fabric_statistics", "iscsi_instance")...)...)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sessions"), fmt.Appendf(nil, "%d\n", n), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestStrandedIsReportedWhenTheHolderIsLoggedInWithADifferentISID is the
 // condition itself: the reservation is live and enforcing, and its holder is
 // present but cannot address it.
 func TestStrandedIsReportedWhenTheHolderIsLoggedInWithADifferentISID(t *testing.T) {
 	cfg, fs := stageStranded(t, "00023d000004", "00023d000007")
-	got := New(fs).StrandedReservations(cfg)
+	got := New(fs).StrandedReservations(cfg).Stranded
 	if len(got) != 1 {
 		t.Fatalf("expected the stranded reservation to be reported, got %v", got)
 	}
@@ -109,7 +133,7 @@ func TestStrandedIsReportedWhenTheHolderIsLoggedInWithADifferentISID(t *testing.
 // make the signal noise.
 func TestMatchingISIDIsNotReported(t *testing.T) {
 	cfg, fs := stageStranded(t, "00023d000004", "00023d000004")
-	if got := New(fs).StrandedReservations(cfg); len(got) != 0 {
+	if got := New(fs).StrandedReservations(cfg).Stranded; len(got) != 0 {
 		t.Errorf("a holder whose session still matches is not stranded, got %v", got)
 	}
 }
@@ -122,7 +146,7 @@ func TestMatchingISIDIsNotReported(t *testing.T) {
 // would recreate the class of false alarm aptplcheck.go was written to remove.
 func TestLoggedOutHolderIsNotReported(t *testing.T) {
 	cfg, fs := stageStranded(t, "00023d000004", "")
-	if got := New(fs).StrandedReservations(cfg); len(got) != 0 {
+	if got := New(fs).StrandedReservations(cfg).Stranded; len(got) != 0 {
 		t.Errorf("a holder with no session may come back with the same id and is not "+
 			"stranded, got %v", got)
 	}
@@ -142,14 +166,14 @@ func TestHolderWithoutAnISIDIsNotReported(t *testing.T) {
 		"SPC-3 Reservation: iSCSI Initiator: "+strandedInitiator,
 		"00023d000007",
 		"Write Exclusive Access, Registrants Only")
-	if got := New(fs).StrandedReservations(cfg); len(got) != 0 {
+	if got := New(fs).StrandedReservations(cfg).Stranded; len(got) != 0 {
 		t.Errorf("a registration with no ISID accepts commands from any session, got %v", got)
 	}
 
 	// The control: the SAME staging with the suffix present must report, or
 	// the test above proves nothing.
 	cfg, fs = stageStranded(t, "00023d000004", "00023d000007")
-	if got := New(fs).StrandedReservations(cfg); len(got) != 1 {
+	if got := New(fs).StrandedReservations(cfg).Stranded; len(got) != 1 {
 		t.Fatalf("control: the identical fixture WITH an ISID must report, got %v", got)
 	}
 }
@@ -166,7 +190,7 @@ func TestAllRegistrantsIsNotReported(t *testing.T) {
 		cfg, fs := stageStrandedFull(t,
 			"SPC-3 Reservation: iSCSI Initiator: "+strandedInitiator+",i,0x00023d000004",
 			"00023d000007", rt)
-		if got := New(fs).StrandedReservations(cfg); len(got) != 0 {
+		if got := New(fs).StrandedReservations(cfg).Stranded; len(got) != 0 {
 			t.Errorf("%s: any registrant can release this, so it is not stranded, got %v", rt, got)
 		}
 	}
@@ -180,7 +204,7 @@ func TestUnreadableReservationTypeStillReports(t *testing.T) {
 	cfg, fs := stageStrandedFull(t,
 		"SPC-3 Reservation: iSCSI Initiator: "+strandedInitiator+",i,0x00023d000004",
 		"00023d000007", "")
-	got := New(fs).StrandedReservations(cfg)
+	got := New(fs).StrandedReservations(cfg).Stranded
 	if len(got) != 1 {
 		t.Fatalf("an unreadable type must not suppress the report, got %v", got)
 	}
@@ -218,7 +242,7 @@ func TestMalformedSessionISIDIsNotReported(t *testing.T) {
 		Backstores: []Backstore{b},
 		Targets:    []Target{{IQN: strandedTargetIQN, TPGs: []TPG{{Tag: 1, Enable: true}}}},
 	}
-	if got := New(fs).StrandedReservations(cfg); len(got) != 0 {
+	if got := New(fs).StrandedReservations(cfg).Stranded; len(got) != 0 {
 		t.Errorf("a session id that failed to parse must not be compared, got %v", got)
 	}
 }
@@ -250,7 +274,7 @@ func TestMatchingSessionOnAnotherTPGIsNotReported(t *testing.T) {
 			{Tag: 2, Enable: true},
 		}}},
 	}
-	if got := New(fs).StrandedReservations(cfg); len(got) != 0 {
+	if got := New(fs).StrandedReservations(cfg).Stranded; len(got) != 0 {
 		t.Errorf("a live session on another TPG matches the registration, so nothing "+
 			"is stranded, got %v", got)
 	}
@@ -259,7 +283,84 @@ func TestMatchingSessionOnAnotherTPGIsNotReported(t *testing.T) {
 // TestNoHolderIsNotReported: no reservation, nothing to strand.
 func TestNoHolderIsNotReported(t *testing.T) {
 	cfg, fs := stageStranded(t, "", "00023d000007")
-	if got := New(fs).StrandedReservations(cfg); len(got) != 0 {
+	if got := New(fs).StrandedReservations(cfg).Stranded; len(got) != 0 {
 		t.Errorf("a backstore with no reservation cannot be stranded, got %v", got)
+	}
+}
+
+// TestMultipathHolderIsNotReportedStranded is the reported bug.
+//
+// An initiator with several concurrent sessions registers on ONE of them. The
+// kernel renders only the last-active session per ACL, and under multipath
+// that is routinely a different leg -- so the holder's identifier did not
+// match the one visible and every multipathed volume holding a reservation was
+// reported stranded, permanently, with remediation advice that would have
+// disturbed healthy fencing.
+//
+// The count is what settles it: four sessions live, one rendered, so the
+// mismatch is not evidence.
+func TestMultipathHolderIsNotReportedStranded(t *testing.T) {
+	cfg, fs := stageStranded(t, "00023d000003", "00023d000004")
+	// Four live sessions, of which the ACL attribute renders one.
+	stageSessionCount(t, fs.Root, strandedTargetIQN, 4)
+
+	rep := New(fs).StrandedReservations(cfg)
+	if len(rep.Stranded) != 0 {
+		t.Errorf("a multipathed holder must NOT be reported stranded: %v", rep.Stranded)
+	}
+	// Not silently dropped: an operator who stops seeing strand reports has to
+	// be able to find out that the detector cannot see one here.
+	if len(rep.Undecided) != 1 {
+		t.Fatalf("the blind spot must be reported, got %v", rep.Undecided)
+	}
+	u := rep.Undecided[0]
+	if u.LiveSessions != 4 || u.VisibleSessions != 1 {
+		t.Errorf("the report must carry both counts, got %+v", u)
+	}
+	if len(u.Backstores) != 1 {
+		t.Errorf("the affected backstore must be named, got %v", u.Backstores)
+	}
+	for _, want := range []string{"multipath", "DETECTOR is blind", strandedTargetIQN} {
+		if !strings.Contains(u.String(), want) {
+			t.Errorf("the report must explain itself, missing %q: %s", want, u.String())
+		}
+	}
+}
+
+// A single-session initiator is still decided, which is the case that keeps
+// genuine strand detection working -- and the case the live pr-isid suite
+// exercises against a real kernel.
+func TestSingleSessionStrandIsStillReported(t *testing.T) {
+	cfg, fs := stageStranded(t, "00023d000003", "00023d000004")
+	stageSessionCount(t, fs.Root, strandedTargetIQN, 1)
+
+	rep := New(fs).StrandedReservations(cfg)
+	if len(rep.Stranded) != 1 {
+		t.Fatalf("one session and a mismatch IS a strand: %+v", rep)
+	}
+	if len(rep.Undecided) != 0 {
+		t.Errorf("nothing is undecided when every session is accounted for: %v", rep.Undecided)
+	}
+}
+
+// An unreadable session count is undecidable, not a strand. Not knowing
+// whether the per-ACL view is complete is not the same as knowing that it is,
+// and claiming a strand on that basis is the guess this check exists to avoid.
+func TestUnreadableSessionCountIsUndecided(t *testing.T) {
+	cfg, fs := stageStranded(t, "00023d000003", "00023d000004")
+	if err := os.Remove(filepath.Join(fs.Root,
+		filepath.Join(append(targetPath(strandedTargetIQN),
+			"fabric_statistics", "iscsi_instance", "sessions")...))); err != nil {
+		t.Fatal(err)
+	}
+	rep := New(fs).StrandedReservations(cfg)
+	if len(rep.Stranded) != 0 {
+		t.Errorf("without the count there is no proof: %v", rep.Stranded)
+	}
+	if len(rep.Undecided) != 1 || rep.Undecided[0].LiveSessions != -1 {
+		t.Fatalf("it must say the count could not be read, got %+v", rep.Undecided)
+	}
+	if !strings.Contains(rep.Undecided[0].String(), "could not be read") {
+		t.Errorf("the reason must be stated: %s", rep.Undecided[0].String())
 	}
 }

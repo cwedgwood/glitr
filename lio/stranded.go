@@ -3,6 +3,7 @@ package lio
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -36,6 +37,53 @@ import (
 // data loss this whole feature exists to prevent. The recovery paths belong to
 // the cluster, not to us: another registered initiator can preempt it (proven
 // in pr-isid), or the volume can be deleted. So this REPORTS and never acts.
+
+// UndecidedStrand names a target where the strand question cannot be answered.
+//
+// The kernel renders exactly ONE session per ACL, so when an initiator holds
+// several at once -- multipath, which is the normal way this product is
+// deployed -- the holder's registration may name a session that is live and
+// simply not the one rendered. A mismatch is then not evidence of anything.
+//
+// Reported rather than silently skipped: an operator who stops seeing strand
+// reports is entitled to know the detector went blind, and why. This is a
+// statement about what the appliance can SEE, not about the storage, so it is
+// deliberately not a warning -- nothing is wrong with the reservation.
+type UndecidedStrand struct {
+	// TargetIQN is the target whose sessions could not be enumerated.
+	TargetIQN string
+	// LiveSessions is what the kernel reports for the whole target, and
+	// VisibleSessions is how many of them the per-ACL attribute renders.
+	// LiveSessions is -1 when the count itself could not be read.
+	LiveSessions, VisibleSessions int
+	// Backstores names the reservations left undecided by this.
+	Backstores []string
+}
+
+func (u UndecidedStrand) String() string {
+	if u.LiveSessions < 0 {
+		return fmt.Sprintf("%s: cannot tell whether these reservations are stranded — "+
+			"the target's live session count could not be read, so a session identifier "+
+			"that does not match the one visible per ACL may still belong to a live "+
+			"session. Affected: %s",
+			u.TargetIQN, strings.Join(u.Backstores, ", "))
+	}
+	return fmt.Sprintf("%s: cannot tell whether these reservations are stranded — the "+
+		"kernel reports %d live sessions but renders only %d of them (one per ACL, the "+
+		"last active), so a holder's session identifier that does not match the visible "+
+		"one may still be live. This is normal with multipath. Nothing is wrong with the "+
+		"reservations; the DETECTOR is blind here. Affected: %s",
+		u.TargetIQN, u.LiveSessions, u.VisibleSessions, strings.Join(u.Backstores, ", "))
+}
+
+// StrandReport is what the strand check found, and what it could not decide.
+type StrandReport struct {
+	// Stranded names reservations PROVEN unaddressable by their holder.
+	Stranded []StrandedReservation
+	// Undecided names targets where the kernel has sessions this cannot see,
+	// so no strand claim about them would be evidence-backed.
+	Undecided []UndecidedStrand
+}
 
 // StrandedReservation names a reservation whose holder cannot address it.
 type StrandedReservation struct {
@@ -112,18 +160,44 @@ func (s StrandedReservation) resTypeText() string {
 // registrant can still release it. Reporting one would be a false alarm, and
 // the remedy text would be wrong twice over.
 //
-// LIMITATION, and it is the kernel's, not ours: the ACL info attribute renders
-// exactly ONE session, se_nacl->nacl_sess, which the kernel documents as "the
-// last active I_T Nexus for each struct se_node_acl" (v6.6
-// drivers/target/target_core_transport.c:426-430). An initiator holding
-// several simultaneous sessions -- multipath, which this project ships a suite
-// for -- may therefore have made its registration on a session that is still
-// live but is no longer the last active one. This searches every TPG and
-// reports only when NO live session it can see matches, which removes the
-// cross-TPG case, but it cannot see a second session to the SAME ACL. The
-// report says what was compared so an operator can tell.
-func (m *Manager) StrandedReservations(cfg Config) []StrandedReservation {
+// THE KERNEL RENDERS ONE SESSION PER ACL, and this refuses to guess past it.
+//
+// The ACL info attribute shows exactly one session, se_nacl->nacl_sess, which
+// the kernel documents as "the last active I_T Nexus for each struct
+// se_node_acl" (v6.6 drivers/target/target_core_transport.c:426-430). An
+// initiator holding several at once -- multipath, which is how this product is
+// normally deployed -- registers on ONE specific nexus, while the last-active
+// one is whichever leg most recently carried I/O. Those routinely differ, and
+// comparing them reported a strand for every multipathed volume holding a
+// reservation: a false alarm whose remediation advice (preempt, clear, detach)
+// would have disturbed healthy fencing. MEASURED on the lab, and reported from
+// a real deployment.
+//
+// So the count is checked first. The target publishes how many sessions are
+// live (fabric_statistics/iscsi_instance/sessions); if that exceeds the number
+// the per-ACL attributes render, the kernel is holding sessions this cannot
+// see, and a holder's session identifier that does not match the visible one
+// may simply be one of them. That is not evidence, so no strand is claimed --
+// it is reported as UNDECIDED instead, naming the affected backstores, because
+// a detector that goes quiet without saying so is worse than one that reports
+// nothing.
+//
+// Detection is unaffected where each initiator holds a single session: the
+// count then matches, the attribute is complete, and a mismatch is proof. That
+// is the case the pr-isid suite exercises against a live kernel.
+//
+// Two data sources were proposed in the report and both were tested and
+// rejected. dynamic_sessions is empty here because this appliance uses
+// explicit ACLs (generate_node_acls=0), so no session is dynamic. And the PR
+// registration table cannot distinguish the two cases at all: the holder's own
+// registration IS the thing being questioned, and it stays in that table after
+// its session is gone -- MEASURED, by rotating an ISID and watching the dead
+// one persist in res_pr_registered_i_pts. Testing membership there would
+// suppress every genuine strand.
+func (m *Manager) StrandedReservations(cfg Config) StrandReport {
 	var out []StrandedReservation
+	blind := m.blindTargets(cfg)
+	undecided := map[string][]string{}
 	for _, b := range cfg.Backstores {
 		// ONE reader for pr/res_holder and pr/res_pr_type, shared with the
 		// unmap fence-loss warning. This used to carry its own regex and its
@@ -157,15 +231,127 @@ func (m *Manager) StrandedReservations(cfg Config) []StrandedReservation {
 		if !ok || slices.Contains(live, want) {
 			continue
 		}
+		name := "backstore/" + string(b.Type) + "/" + b.Name
+		// The mismatch is real, but it is only EVIDENCE where every live
+		// session is accounted for. Where it is not, the holder's nexus may be
+		// one of the sessions the kernel is not rendering.
+		if t := m.blindTargetFor(cfg, holder, blind); t != "" {
+			undecided[t] = append(undecided[t], name)
+			continue
+		}
 		out = append(out, StrandedReservation{
-			Backstore: "backstore/" + string(b.Type) + "/" + b.Name,
+			Backstore: name,
 			Initiator: holder,
 			WantISID:  want,
 			LiveISID:  strings.Join(live, ", "),
 			ResType:   resType,
 		})
 	}
+	rep := StrandReport{Stranded: out}
+	for iqn, names := range undecided {
+		b := blind[iqn]
+		slices.Sort(names)
+		rep.Undecided = append(rep.Undecided, UndecidedStrand{
+			TargetIQN: iqn, LiveSessions: b.live, VisibleSessions: b.visible,
+			Backstores: names,
+		})
+	}
+	slices.SortFunc(rep.Undecided, func(a, b UndecidedStrand) int {
+		return strings.Compare(a.TargetIQN, b.TargetIQN)
+	})
+	return rep
+}
+
+// blindness records, per target, how many sessions the kernel says are live
+// and how many the per-ACL attributes actually render.
+type blindness struct{ live, visible int }
+
+// blindTargets reports which targets have sessions the ACL attributes cannot
+// enumerate.
+//
+// A target is blind when the kernel's live session count exceeds the number of
+// ACLs rendering a session -- which means at least one ACL holds several, and
+// nothing says WHICH. It is also treated as blind when the count cannot be
+// read at all: not knowing whether the attribute is complete is not the same
+// as knowing that it is, and claiming a strand on that basis would be the
+// guess this check exists to avoid.
+func (m *Manager) blindTargets(cfg Config) map[string]blindness {
+	out := map[string]blindness{}
+	for _, t := range cfg.Targets {
+		// Counted from the KERNEL's ACL directories, not from cfg. The number
+		// this is compared against is the kernel's, so the other side of the
+		// comparison has to be too: an ACL the kernel has and the desired
+		// config does not would otherwise make the target look blind, and one
+		// the config has and the kernel does not would hide that it is.
+		visible := 0
+		for _, g := range t.TPGs {
+			names, err := m.fs.ReadDir(append(tpgPath(t.IQN, g.Tag), "acls")...)
+			if err != nil {
+				continue
+			}
+			for _, n := range names {
+				raw, err := m.fs.ReadAttr(append(aclPath(t.IQN, g.Tag, n), "info")...)
+				if err != nil {
+					continue
+				}
+				if _, perr := ParseSessionISID(raw); perr == nil {
+					visible++
+				}
+			}
+		}
+		live, err := m.liveSessionCount(t.IQN)
+		switch {
+		case err != nil:
+			out[t.IQN] = blindness{live: -1, visible: visible}
+		case live > visible:
+			out[t.IQN] = blindness{live: live, visible: visible}
+		}
+	}
 	return out
+}
+
+// blindTargetFor returns the blind target this initiator has a session on, or
+// "" when every target it is logged into can be fully enumerated.
+func (m *Manager) blindTargetFor(cfg Config, initiator string, blind map[string]blindness) string {
+	if len(blind) == 0 {
+		return ""
+	}
+	for _, t := range cfg.Targets {
+		if _, ok := blind[t.IQN]; !ok {
+			continue
+		}
+		for _, g := range t.TPGs {
+			raw, err := m.fs.ReadAttr(append(aclPath(t.IQN, g.Tag, initiator), "info")...)
+			if err != nil {
+				continue
+			}
+			if _, perr := ParseSessionISID(raw); perr == nil {
+				return t.IQN
+			}
+		}
+	}
+	return ""
+}
+
+// liveSessionCount is how many iSCSI sessions the kernel currently holds for a
+// target.
+//
+// Read from fabric_statistics/iscsi_instance/sessions, which is a LIVE count
+// rather than a cumulative one -- MEASURED: four sessions read 4, and reading
+// it again after logging them all out read 0. It is the only place the kernel
+// publishes a number that can be compared against what the per-ACL attributes
+// render.
+func (m *Manager) liveSessionCount(iqn string) (int, error) {
+	raw, err := m.fs.ReadAttr(append(targetPath(iqn), "fabric_statistics", "iscsi_instance", "sessions")...)
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(strings.ReplaceAll(raw, "\x00", "")))
+	if err != nil {
+		return 0, fmt.Errorf("session count for %s is %q, which is not a number -- the "+
+			"format changed and this comparison is no longer trustworthy", iqn, strings.TrimSpace(raw))
+	}
+	return n, nil
 }
 
 // liveISIDs returns every session identifier the target can see for this

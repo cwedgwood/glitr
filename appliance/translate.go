@@ -288,7 +288,7 @@ func (c *Coordinator) reconcile() (lio.Report, error) {
 	unbound := c.lio.VerifyAPTPL(desired)
 	// Same traversal, same moment: a stranded reservation is only meaningful
 	// against the tree that was just reconciled.
-	stranded := strandedText(c.lio.StrandedReservations(desired))
+	stranded, undecided := strandedText(c.lio.StrandedReservations(desired))
 	// Drift is re-derived, NOT taken from rep: ApplyDelta only visits
 	// backstores whose desired config changed, so rep.Drift covers that
 	// subset while drift is a standing condition covering the whole tree.
@@ -299,7 +299,7 @@ func (c *Coordinator) reconcile() (lio.Report, error) {
 
 	c.lastReconcileErr = nil
 	c.applied = appliedView(desired, drift)
-	c.publishReconcile(nil, unbound, stranded, drift)
+	c.publishReconcile(nil, unbound, stranded, undecided, drift)
 	c.logSlow(rep, "incremental")
 	return rep, nil
 }
@@ -322,7 +322,8 @@ func (c *Coordinator) reconcileFull(desired lio.Config) (lio.Report, error) {
 	// Sync visits every desired backstore, so its report IS the whole-tree
 	// view here; only the incremental path needs re-derivation. Published as
 	// one generation under a single lock -- see publishReconcile.
-	c.publishReconcile(nil, rep.APTPLUnbound, strandedText(c.lio.StrandedReservations(desired)), rep.Drift)
+	syncStranded, syncUndecided := strandedText(c.lio.StrandedReservations(desired))
+	c.publishReconcile(nil, rep.APTPLUnbound, syncStranded, syncUndecided, rep.Drift)
 	c.logSlow(rep, "full")
 	return rep, err
 }

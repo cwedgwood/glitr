@@ -56,9 +56,9 @@ func TestHealthSnapshotIsAtomic(t *testing.T) {
 			default:
 			}
 			if i%2 == 0 {
-				c.publishReconcile(nil, []string{"vol_a: not in effect"}, nil, nil)
+				c.publishReconcile(nil, []string{"vol_a: not in effect"}, nil, nil, nil)
 			} else {
-				c.publishReconcile(errors.New("reconcile failed"), nil, nil, nil)
+				c.publishReconcile(errors.New("reconcile failed"), nil, nil, nil, nil)
 			}
 		}
 	})
@@ -207,7 +207,7 @@ func TestStrandedReservationIsReportedButNotDegraded(t *testing.T) {
 	c.publishReconcile(nil, nil, []string{
 		"backstore/fileio/vol_x: reservation held by iqn.1993-08.org.debian:01:a " +
 			"cannot be released by it",
-	}, nil)
+	}, nil, nil)
 
 	h := c.HealthSnapshot()
 	if len(h.PRStranded) != 1 {
@@ -270,7 +270,7 @@ func TestHealthReportsFencingSignalsOnEveryPath(t *testing.T) {
 		c := &Coordinator{}
 		// Through the production publisher, not by setting fields: a test that
 		// stages state its own way can pass while the real path is broken.
-		c.publishReconcile(nil, []string{"vol0: saved registration did not bind"}, nil, nil)
+		c.publishReconcile(nil, []string{"vol0: saved registration did not bind"}, nil, nil, nil)
 		code, body := get(c)
 		if body["status"] == "ok" {
 			t.Error("a reservation that is not in effect was reported as status ok")
@@ -294,7 +294,7 @@ func TestHealthReportsFencingSignalsOnEveryPath(t *testing.T) {
 		// fencing.
 		c.publishReconcile(nil,
 			[]string{"vol0: saved registration did not bind"},
-			[]string{"vol1: holder cannot release"}, nil)
+			[]string{"vol1: holder cannot release"}, nil, nil)
 		c.publishReconcileFailure(errors.New("reconcile failed"))
 		code, body := get(c)
 		if code != http.StatusServiceUnavailable {
@@ -314,4 +314,47 @@ func TestHealthReportsFencingSignalsOnEveryPath(t *testing.T) {
 			t.Errorf("a healthy appliance reported %v, want ok", body["status"])
 		}
 	})
+}
+
+// TestUndecidedStrandIsNotAWarning: the reported bug was not only a wrong
+// entry in pr_stranded, it was a permanent status of "warning" on every
+// multipathed volume holding a reservation. Being unable to answer a question
+// is not a fault in the storage, so it must not spend the appliance's one
+// attention-getting signal.
+func TestUndecidedStrandIsNotAWarning(t *testing.T) {
+	c := &Coordinator{}
+	c.publishReconcile(nil, nil, nil,
+		[]string{"iqn.x:t: cannot tell whether these reservations are stranded — " +
+			"the kernel reports 8 live sessions but renders only 1"}, nil)
+
+	h := c.HealthSnapshot()
+	if len(h.PRStrandUndecided) != 1 {
+		t.Fatalf("the blind spot must be reported: %+v", h)
+	}
+	if len(h.PRStranded) != 0 {
+		t.Errorf("it must not be reported as a strand: %v", h.PRStranded)
+	}
+
+	srv := httptest.NewServer(Handler(c))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + APIPrefix + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200: not being able to answer is not degraded",
+			resp.StatusCode)
+	}
+	if got := body["status"]; got != "ok" {
+		t.Errorf("status = %v, want ok -- this is what made every multipathed "+
+			"appliance sit permanently at warning", got)
+	}
+	if _, ok := body["pr_strand_undecided"]; !ok {
+		t.Error("the field must still be served, or the detector goes blind in silence")
+	}
 }
