@@ -278,7 +278,17 @@ jobs:
         with:
           go-version: stable
       - name: install staticcheck
-        run: go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+        # Pinned, and the pin has to be MAINTAINED rather than set and
+        # forgotten: staticcheck parses the toolchain's export data, so a
+        # version older than the Go that `go-version: stable` resolves to
+        # fails outright -- not with a lint finding, but with
+        #   internal error in importing "internal/byteorder"
+        #   (export data version 4 is greater than maximum supported version 2)
+        # on every stdlib import. That is what v0.7.0 did once Go moved to
+        # export data v4, and it broke every PR at once rather than degrading.
+        # When it recurs, the fix is to raise this pin to a staticcheck built
+        # against the current Go, not to unpin it.
+        run: go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
       - name: staticcheck
         run: staticcheck ./...
 
