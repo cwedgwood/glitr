@@ -17,3 +17,16 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 5
+    groups:
+      # codeql-action/init and codeql-action/analyze MUST move together.
+      # They are two paths within one action, so dependabot treats them as two
+      # dependencies and opens a PR for each -- and CodeQL refuses to run when
+      # the halves disagree:
+      #   Loaded a configuration file for version '4.37.9',
+      #   but running version '4.37.6'
+      # So each PR fails on its own and neither can ever merge first. Both were
+      # correct; the split was the defect. Grouping makes it one PR that moves
+      # both pins at once, which is the only shape that can pass.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
